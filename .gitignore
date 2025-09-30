@@ -1,0 +1,9 @@
+*.mp4
+*.aac
+*.json
+*.csv
+GBRvid*
+data_offset
+output
+*.wav
+*.txt
