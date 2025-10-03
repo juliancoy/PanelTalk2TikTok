@@ -1,34 +1,30 @@
-#!/usr/bin/env bash
-set -euo pipefail
+docker run --rm --gpus all \
+  --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v "$PWD":/work -w /work \
+  -v "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  -v "$HOME/.cache/ctranslate2":/root/.cache/ctranslate2 \
+  -v "$HOME/.pytorch24":/root/.pytorch24 \
+  nvcr.io/nvidia/pytorch:24.12-py3 \
+  bash -c '
+    set -euo pipefail
 
-# Input file (change if needed)
-AUDIO="$1"
+    export TARGET=/root/.pytorch24
+    # SAFE: don’t assume PYTHONPATH is set
+    export PYTHONPATH="${TARGET}${PYTHONPATH:+:$PYTHONPATH}"
+    pip list
 
-# Optional: sanity check before running
-[ -f "$AUDIO" ] || { echo "File not found: $AUDIO"; exit 1; }
+    # Installs (add --upgrade if you want to suppress "already exists" warnings)
+    (python -m pip show whisperx >/dev/null 2>&1 || \
+      pip install --no-deps --target="$TARGET" git+https://github.com/m-bain/whisperx.git)
+    pip install --no-deps --target="$TARGET" \
+      ctranslate2 faster_whisper av tokenizers==0.20.3 huggingface_hub transformers==4.45.2 \
+      pyannote.audio==3.1.1 pyannote.core==6.0.1 pyannote.database==6.1.0 pyannote.metrics==4.0.0 pytorch_lightning torchmetrics torchaudio
 
-docker run --rm -it \
-  --gpus all \
-  --env AUDIO="$AUDIO" \
-  --mount type=bind,src="$(pwd)",dst=/app \
-  --mount type=volume,src=whisper-venv,dst=/venv \
-  --mount type=volume,src=pip-cache,dst=/root/.cache/pip \
-  --mount type=volume,src=whisper-model-cache,dst=/root/.cache/whisper \
-  --workdir /app \
-  pytorch/pytorch:latest \
-  bash -lc '
-    set -e
-    apt-get update && apt-get install -y ffmpeg git && \
-    python -m venv /venv && . /venv/bin/activate && \
-    pip install --upgrade pip && \
-    pip install git+https://github.com/openai/whisper.git && \
-    mkdir -p /app/transcripts && \
-    # Use the env var AUDIO inside the container and the bind mount path /app
-    whisper "/app/$AUDIO" \
-      --model large-v3 \
-      --output_dir /app/transcripts \
-      --output_format all \
-      --word_timestamps True
-
-  '
-
+    # Run transcribe.py, honoring .pth in TARGET for namespace packages (pyannote.*)
+    python - <<PY "$@"
+import site, runpy, sys
+site.addsitedir("/root/.pytorch24")
+sys.argv = ["transcribe.py"] + sys.argv[1:]
+runpy.run_path("transcribe.py", run_name="__main__")
+PY
+  ' _ "$@"

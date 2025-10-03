@@ -17,6 +17,11 @@ import cv2
 import numpy as np
 
 try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+try:
     import mediapipe as mp
 except ImportError:
     raise SystemExit("Missing: mediapipe. Install: pip install mediapipe")
@@ -146,8 +151,12 @@ def main():
     ap.add_argument("--every-n", type=int, default=1)
     ap.add_argument("--show", action="store_true")
     ap.add_argument("--viz-inner-lip", action="store_true")
-    ap.add_argument("--buffer-frames", type=int, default=90,
+    ap.add_argument("--buffer-frames", type=int, default=30,
                     help="Buffer length in frames")
+    ap.add_argument("--detection-confidence", type=float, default=0.2,
+                    help="Minimum detection confidence for face detection (default: 0.2)")
+    ap.add_argument("--tracking-confidence", type=float, default=0.2,
+                    help="Minimum tracking confidence for face detection (default: 0.2)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.video)
@@ -166,14 +175,19 @@ def main():
         static_image_mode=False,
         max_num_faces=args.max_faces,
         refine_landmarks=True,
-        min_detection_confidence=0.2,
-        min_tracking_confidence=0.2
-
+        min_detection_confidence=args.detection_confidence,
+        min_tracking_confidence=args.tracking_confidence
     )
 
     tracker = InnerLipTracker(iou_thresh=0.25, min_frames=2)
     timeline = []
     frame_idx = -1
+
+    # Create progress bar if tqdm is available
+    if tqdm:
+        pbar = tqdm(total=total_frames, desc="Processing frames", unit="frame")
+    else:
+        pbar = None
 
     try:
         while True:
@@ -181,6 +195,11 @@ def main():
             if not ok:
                 break
             frame_idx += 1
+            
+            # Update progress bar
+            if pbar:
+                pbar.update(1)
+            
             if frame_idx % args.every_n != 0:
                 continue
 
@@ -258,6 +277,9 @@ def main():
                     break
 
     finally:
+        # Close progress bar if it exists
+        if pbar:
+            pbar.close()
         cap.release()
         cv2.destroyAllWindows()
         face_mesh.close()

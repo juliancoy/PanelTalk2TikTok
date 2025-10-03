@@ -17,6 +17,7 @@ def export_words_to_csv(json_file, csv_file):
         for segment in data.get("segments", []):
             for word_info in segment.get("words", []):
                 writer.writerow([
+                    word_info.get("speaker"),
                     word_info.get("start"),
                     word_info.get("end"),
                     word_info.get("word").strip()
