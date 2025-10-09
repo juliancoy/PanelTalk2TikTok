@@ -5,6 +5,7 @@ and combine them into a final output video using OpenCV.
 
 Modified to also accept JSON input with bounding box data for speaker-focused extraction.
 """
+from datetime import datetime, timezone
 
 import pandas as pd
 import cv2
@@ -20,6 +21,73 @@ import argparse
 import time
 from tqdm import tqdm
 import bisect
+import math
+import shlex
+
+def probe_fps(path):
+    out = subprocess.check_output([
+        "ffprobe","-v","error","-select_streams","v:0",
+        "-show_entries","stream=avg_frame_rate","-of","default=nw=1:nk=1", path
+    ]).decode().strip()  # e.g. "30000/1001"
+    num, den = map(int, out.split("/"))
+    return num/den  # float and rational string
+
+
+def extract_audio_segments(word_segment_times, audio_file, output_audio_file, fade_samples:int=3000):
+    """
+    Faster version of extract_audio_segments().
+    Avoids repeated array reallocations and redundant conversions.
+    """
+
+    # Load and extract metadata
+    audio = AudioSegment.from_file(audio_file)
+    sr = audio.frame_rate
+    ch = audio.channels
+    sw = audio.sample_width  # bytes per sample (1,2,3,4)
+
+    dtype = {1: np.int8, 2: np.int16, 3: np.int32, 4: np.int32}[min(sw, 4)]
+    full_scale = float((1 << (8 * min(sw, 3) - 1)) - 1)
+
+    # Zero-copy decode
+    raw = np.frombuffer(audio.raw_data, dtype=dtype)
+    frames = raw.reshape((-1, ch)).astype(np.float32) / full_scale
+
+    # Precompute crossfade windows
+    t = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)[:, None]
+    fade_out = np.cos(t * np.pi / 2.0)
+    fade_in = np.sin(t * np.pi / 2.0)
+
+    segments = []
+
+    for i, row in enumerate(tqdm(word_segment_times, desc="Extracting audio")):
+        start = int(row["start"] * sr)
+        end = int(row["end"] * sr)
+        if start >= end:
+            raise Exception(f"Start >= End {row} {start} {end}")
+        seg = frames[start:end]
+
+        prev = []
+        if segments:
+            prev = segments[-1]
+
+        if len(prev)>fade_samples:
+            overlap_in = frames[start-fade_samples:start] * fade_in
+            prev[-fade_samples:] = prev[-fade_samples:] * fade_out + overlap_in
+
+        segments += [seg]
+
+    # Combine all at once
+    out = np.concatenate(segments, axis=0)
+
+    # Convert to int16
+    out_i16 = np.clip(out * 32767.0, -32768, 32767).astype(np.int16)
+
+    pcm = out_i16.reshape(-1) # interleaved 
+    out_seg = AudioSegment( data=pcm.tobytes(), frame_rate=sr, sample_width=2, # 16-bit 
+                           channels=ch, ) 
+    out_seg.export(output_audio_file, format="wav") 
+    print(f"✅ Audio segments extracted to: {output_audio_file}") 
+    return output_audio_file
 
 
 def add_text_with_shadow(frame, text, font_scale=4.0):
@@ -222,30 +290,29 @@ def visualize_extraction_process(frame, current_time, word, speaker_info=None, o
     
     return True  # Continue processing
 
-def preprocess_speaker_data(json_data, window_size=3.0):
+def preprocess_speaker_data(speaking_times, window_size=3.0):
     """
     Preprocess speaker data with a centered mode filter to smooth speaker transitions.
+    Combines preprocessing and speaker computation into a single function.
     Optimized with NumPy for better performance.
     
     Args:
-        json_data: List of JSON entries with time and people data
+        speaking_times: List of JSON entries with time and people data
         window_size: Size of the moving window in seconds
     
     Returns:
-        List of JSON entries with smoothed speaker data
+        List of JSON entries with smoothed speaker data and times
     """
-    if not json_data:
-        return json_data
     
     # Sort by time
-    json_data = sorted(json_data, key=lambda x: x['time'])
+    speaking_times_averaged = sorted(speaking_times, key=lambda x: x['time'])
     
     # Extract times for faster window calculations
-    times = np.array([entry['time'] for entry in json_data])
+    times = np.array([entry['time'] for entry in speaking_times_averaged])
     
     # Precompute all speaker data for faster processing
     all_speaker_data = []
-    for entry in json_data:
+    for entry in speaking_times_averaged:
         speakers = {}
         for person in entry['people']:
             if person.get('speaking', False):
@@ -255,7 +322,7 @@ def preprocess_speaker_data(json_data, window_size=3.0):
     # Create a new list for processed data
     processed_data = []
     
-    for i, entry in enumerate(json_data):
+    for i, entry in enumerate(speaking_times_averaged):
         current_time = entry['time']
         
         # Find entries within the window using NumPy vectorization
@@ -286,494 +353,457 @@ def preprocess_speaker_data(json_data, window_size=3.0):
         
         processed_data.append(processed_entry)
     
-    return processed_data
+    return processed_data, times.tolist()
 
-def extract_video_segments_with_cropping(csv_file, json_file, video_file, output_video_file, output_width, output_height, visualize=False, font_scale=4.0, min_stay_duration=1.5):
+import numpy as np
+
+def fix_zero_length_words(word_segment_times, sr, preappend_budget=0.2):
     """
-    Extract video segments based on CSV time periods and crop each frame to focus on the speaker using JSON data.
-    Stays on each person for at least min_stay_duration seconds after switching target.
-    After 8 seconds of continuous speaking, cycles through all people randomly including whole scene view.
-    
-    Args:
-        csv_file (str): Path to CSV file with start, end, word columns
-        json_file (str): Path to JSON file with time, people, and speaking data
-        video_file (str): Path to video file
-        output_video_file (str): Path for output video file
-        output_width (int): Width of output window
-        output_height (int): Height of output window
-        visualize (bool): Whether to show real-time visualization
-        font_scale (float): Font scale for text overlay
-        min_stay_duration (float): Minimum time in seconds to stay on a person after switching target
+    word_segment_times: list[dict], each dict at least has {"start": float, "end": float, ...}
+    Mutates a copy of the list and returns it.
     """
-    
-    # Read CSV file
-    df = pd.read_csv(csv_file)
-    
-    # Read JSON file
-    with open(json_file, 'r') as f:
-        json_data = json.load(f)
-    
-    # Preprocess speaker data with 3-second mode filter
-    print("Preprocessing speaker data with 3-second mode filter...")
-    json_data = preprocess_speaker_data(json_data, window_size=3.0)
-    print("Speaker data preprocessing complete.")
-    
-    # Open video file
-    cap = cv2.VideoCapture(video_file)
-    
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    print(f"Video properties: {width}x{height}, {fps} fps, {total_frames} frames")
-    print(f"Output window size: {output_width}x{output_height}")
-    print(f"Minimum stay duration: {min_stay_duration}s")
-    
-    # Create video writer for output
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_file, fourcc, fps, (output_width, output_height))
-    
-    # Create a mapping from time to JSON entry for quick lookup
-    json_time_map = {}
-    for entry in json_data:
-        time = entry['time']
-        json_time_map[time] = entry
-    
-    # Initialize speaker tracking variables
-    current_speaker = None
-    last_speaker_change_time = 0
-    last_speaker_box = None
-    current_speaker_start_time = 0
-    last_camera_center = None
-    # Track last visit time for each person
-    last_visit_times = {}
-    
-    # Initialize visualization window if needed
-    if visualize:
-        cv2.namedWindow('Extraction Visualizer', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Extraction Visualizer', 1200, 800)
-        print("Visualizer started. Press 'q' to quit, 'p' to pause.")
+    totaltime = 0
+    preappend_budget = int(preappend_budget*sr)/sr
+    if not word_segment_times:
+        return []
 
-    # Precompute list of times once, outside the frame loop
-    json_times = [entry['time'] for entry in json_data]
+    out = [dict(word_segment_times[0])]  # copy first row as-is
+    for i in range(1, len(word_segment_times)):
+        prev = out[-1]                               # previous (already possibly adjusted)
+        curr = dict(word_segment_times[i])           # copy current
 
-    # Extract segments based on CSV
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Processing segments"):
-        start_time = row['start']
-        end_time = row['end']
-        word = row['word']
-        
-        # Convert time to frame numbers
-        start_frame = int(start_time * fps)
-        end_frame = int(end_time * fps)
-        
-        # Set starting position
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        
-        # Extract frames for this segment
-        for frame_num in range(start_frame, end_frame):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            # Calculate current time for this frame
-            current_time = frame_num / fps
-            
-            # Then inside your frame loop:
-            idx = bisect.bisect_left(json_times, current_time)
+        curr_len = curr["end"] - curr["start"]
+        if curr_len <= 0:
+            # Compute allowable pull-back
+            prev_dur = max(0.0, prev["end"] - prev["start"])
+            halftime = 0.5 * prev_dur
+            budget = min(preappend_budget, halftime)
 
-            # Pick the closest index (either idx or idx-1)
-            if idx == 0:
-                closest_entry = json_data[0]
-            elif idx == len(json_times):
-                closest_entry = json_data[-1]
-            else:
-                before = json_data[idx - 1]
-                after = json_data[idx]
-                if abs(before['time'] - current_time) <= abs(after['time'] - current_time):
-                    closest_entry = before
-                else:
-                    closest_entry = after
-            
-            if closest_entry:
-                # Find the speaking person
-                current_speaker_candidate = None
-                for person in closest_entry['people']:
-                    if person.get('speaking', False):
-                        current_speaker_candidate = person
-                        break
-                
-                # Check if we should switch to a new speaker
-                should_switch_speaker = False
-                if current_speaker_candidate:
-                    if current_speaker is None:
-                        # No current speaker, switch immediately
-                        should_switch_speaker = True
-                    elif current_speaker_candidate['id'] != current_speaker['id']:
-                        # Different speaker, check if we've stayed long enough
-                        time_since_last_change = current_time - last_speaker_change_time
-                        if time_since_last_change >= min_stay_duration:
-                            should_switch_speaker = True
-                
-                # Update speaker if needed
-                if should_switch_speaker:
-                    # Update visit time for current speaker before switching
-                    if current_speaker:
-                        last_visit_times[current_speaker['id']] = current_time
-                    
-                    current_speaker = current_speaker_candidate
-                    last_speaker_change_time = current_time
-                    current_speaker_start_time = current_time
-                    if current_speaker:
-                        last_speaker_box = current_speaker['box']
-                        # Update visit time for new speaker
-                        last_visit_times[current_speaker['id']] = current_time
-                        #print(f"Switched to speaker {current_speaker['id']} at {current_time:.2f}s")
-                
-                # Check if we should switch to least recently visited person or zoomed-out mode (after 8 seconds of continuous speaking)
-                if current_speaker:
-                    time_speaking = current_time - current_speaker_start_time
-                    if time_speaking >= 8.0:
-                        # Check if we've stayed long enough on current speaker
-                        time_since_last_change = current_time - last_speaker_change_time
-                        if time_since_last_change >= min_stay_duration:
-                            # Find available people (excluding current speaker)
-                            available_people = [p for p in closest_entry['people'] if p['id'] != current_speaker['id']]
-                            
-                            if available_people:
-                                # Find the least recently visited person
-                                least_recent_person = None
-                                least_recent_time = float('inf')
-                                
-                                for person in available_people:
-                                    person_id = person['id']
-                                    last_visit = last_visit_times.get(person_id, 0)  # Default to 0 if never visited
-                                    if last_visit < least_recent_time:
-                                        least_recent_time = last_visit
-                                        least_recent_person = person
-                                
-                                if least_recent_person:
-                                    # Update visit time for current speaker before switching
-                                    last_visit_times[current_speaker['id']] = current_time
-                                    
-                                    # Switch to least recently visited person
-                                    current_speaker = least_recent_person
-                                    last_speaker_box = current_speaker['box']
-                                    current_speaker_start_time = current_time
-                                    last_speaker_change_time = current_time
-                                    # Update visit time for new speaker
-                                    last_visit_times[current_speaker['id']] = current_time
-                                    print(f"Switched to least recently visited speaker {current_speaker['id']} at {current_time:.2f}s after {time_speaking:.2f}s of speaking")
-                                            # Randomly decide whether to show zoomed-out view or switch to another person
-                            else: 
-                                # Switch to zoomed-out mode with blue background
-                                current_speaker = None
-                                last_speaker_box = None
-                                current_speaker_start_time = current_time
-                                last_speaker_change_time = current_time
-                                print(f"Switched to zoomed-out mode at {current_time:.2f}s after {time_speaking:.2f}s of speaking")
+            # Limit 1: at most `budget` earlier than nominal start
+            candidate = curr["start"] - budget
 
-                # Use current speaker for cropping
-                target_person = current_speaker
-                
-                # Process frame based on target
-                if target_person and target_person.get('box'):
-                    # Extract cropped segment centered on person with camera movement smoothing
-                    cropped_frame, new_center = extract_cropped_segment(frame, target_person['box'], output_width, output_height, last_camera_center)
-                    last_camera_center = new_center
-                    
-                    # Add word overlay with drop shadow
-                    frame_with_text = add_text_with_shadow(cropped_frame, word, font_scale=font_scale)
-                    
-                    out.write(frame_with_text)
-                    
-                    # Show visualization if enabled
-                    if visualize:
-                        continue_processing = visualize_extraction_process(
-                            frame_with_text, current_time, word, target_person, frame, show_original=True
-                        )
-                        if not continue_processing:
-                            print("Visualizer stopped by user.")
-                            cap.release()
-                            out.release()
-                            cv2.destroyAllWindows()
-                            return
-                    
-                    #print(f"Extracted frame {frame_num} at {current_time:.2f}s for {target_person['id']}")
-                
-                # Use current speaker for cropping (original logic)
-                elif current_speaker and last_speaker_box:
-                    # Extract cropped segment centered on speaker with camera movement smoothing
-                    cropped_frame, new_center = extract_cropped_segment(frame, last_speaker_box, output_width, output_height, last_camera_center)
-                    last_camera_center = new_center
-                    
-                    # Add word overlay with drop shadow
-                    frame_with_text = add_text_with_shadow(cropped_frame, word, font_scale=font_scale)
-                    
-                    out.write(frame_with_text)
-                    
-                    # Show visualization if enabled
-                    if visualize:
-                        continue_processing = visualize_extraction_process(
-                            frame_with_text, current_time, word, current_speaker, frame, show_original=True
-                        )
-                        if not continue_processing:
-                            print("Visualizer stopped by user.")
-                            cap.release()
-                            out.release()
-                            cv2.destroyAllWindows()
-                            return
-                    
-                    print(f"Extracted frame {frame_num} at {current_time:.2f}s for speaker {current_speaker['id']}")
-                else:
-                    # Zoomed-out mode with blue background and scaled video in center
-                    blue_background = np.full((output_height, output_width, 3), [255, 0, 0], dtype=np.uint8)  # Blue background
-                    
-                    # Scale the original frame to match output width while maintaining aspect ratio
-                    frame_height, frame_width = frame.shape[:2]
-                    scale_factor = output_width / frame_width
-                    scaled_height = int(frame_height * scale_factor)
-                    
-                    # Resize frame to match output width
-                    scaled_frame = cv2.resize(frame, (output_width, scaled_height))
-                    
-                    # Calculate vertical position to center the scaled frame
-                    y_offset = (output_height - scaled_height) // 2
-                    
-                    # Place scaled frame in center of blue background
-                    if y_offset >= 0:
-                        blue_background[y_offset:y_offset+scaled_height, :] = scaled_frame
-                    else:
-                        # If scaled frame is taller than output, crop it to fit
-                        crop_start = -y_offset // 2
-                        crop_end = crop_start + output_height
-                        blue_background = scaled_frame[crop_start:crop_end, :]
-                    
-                    frame_with_text = add_text_with_shadow(blue_background, word, font_scale=font_scale)
-                    out.write(frame_with_text)
-                    
-                    # Show visualization if enabled
-                    if visualize:
-                        continue_processing = visualize_extraction_process(
-                            frame_with_text, current_time, word, None, frame, show_original=True
-                        )
-                        if not continue_processing:
-                            print("Visualizer stopped by user.")
-                            cap.release()
-                            out.release()
-                            cv2.destroyAllWindows()
-                            return
-            else:
-                print(f"No JSON data found for time {current_time:.2f}s, using full frame")
-                # If no JSON data found, use full frame (resized to output dimensions)
-                resized_frame = cv2.resize(frame, (output_width, output_height))
-                frame_with_text = add_text_with_shadow(resized_frame, word, font_scale=font_scale)
-                out.write(frame_with_text)
-                
-                # Show visualization if enabled
-                if visualize:
-                    continue_processing = visualize_extraction_process(
-                        frame_with_text, current_time, word, None, frame, show_original=True
-                    )
-                    if not continue_processing:
-                        print("Visualizer stopped by user.")
-                        cap.release()
-                        out.release()
-                        cv2.destroyAllWindows()
-                        return
-    
-    # Release resources
-    cap.release()
-    out.release()
-    
-    # Close visualization window if it was opened
-    if visualize:
-        cv2.destroyAllWindows()
-    
-    print(f"Video segments extracted to: {output_video_file}")
+            # Limit 2: do not advance earlier than the previous word's midpoint
+            prev_midpoint_limit = prev["end"] - halftime  # == prev["start"] + halftime
 
-def extract_video_segments(csv_file, video_file, output_video_file, visualize=False, font_scale=4.0):
+            new_start = max(candidate, prev_midpoint_limit)
+
+            # Ensure we don't go before the previous *start* (can happen if prev_dur == 0)
+            new_start = max(new_start, prev["start"])
+
+            # Adjust previous end only if we overlapped it
+            if new_start < prev["end"]:
+                prev["end"] = new_start
+
+            # Commit the new start; clamp end if needed (still allow zero-length after move)
+            curr["start"] = new_start
+            if curr["end"] < curr["start"]:
+                curr["end"] = curr["start"]
+        totaltime += curr["end"] - curr["start"]
+        out.append(curr)
+    print(totaltime)
+    return out
+
+def precompute_segments(word_segment_times, fps):
     """
-    Extract video segments using OpenCV based on time periods in CSV.
-    Each segment will have the corresponding word superimposed with drop shadow.
-    
-    Args:
-        csv_file (str): Path to CSV file with start, end, word columns
-        video_file (str): Path to video file
-        output_video_file (str): Path for output video file
-        visualize (bool): Whether to show real-time visualization
-        font_scale (float): Font scale for text overlay
+    Convert word segments to frame-aligned timing with sub-frame delta correction.
     """
-    
-    # Read CSV file
-    df = pd.read_csv(csv_file)
-    
-    # Open video file
-    cap = cv2.VideoCapture(video_file)
-    
-    # Get video properties
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    print(f"Video properties: {width}x{height}, {fps} fps, {total_frames} frames")
-    
-    # Create video writer for output
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_video_file, fourcc, fps, (width, height))
-    
-    # Initialize visualization window if needed
-    if visualize:
-        cv2.namedWindow('Extraction Visualizer', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Extraction Visualizer', 1200, 800)
-        print("Visualizer started. Press 'q' to quit, 'p' to pause.")
-    
-    # Extract segments
-    for _, row in df.iterrows():
-        start_time = row['start']
-        end_time = row['end']
-        word = row['word']
-        
-        # Convert time to frame numbers
-        start_frame = int(start_time * fps)
-        end_frame = int(end_time * fps)
-        
-        print(f"Extracting segment: '{word}' from {start_time:.2f}s to {end_time:.2f}s "
-              f"(frames {start_frame} to {end_frame})")
-        
-        # Set starting position
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        
-        # Extract frames for this segment
-        for frame_num in range(start_frame, end_frame):
-            ret, frame = cap.read()
-            if not ret:
-                print(f"Warning: Could not read frame {frame_num}")
-                break
-            
-            # Calculate current time for this frame
-            current_time = frame_num / fps
-            
-            # Add word overlay with drop shadow
-            frame_with_text = add_text_with_shadow(frame, word, font_scale=font_scale)
-            
-            out.write(frame_with_text)
-            
-            # Show visualization if enabled
-            if visualize:
-                continue_processing = visualize_extraction_process(
-                    frame_with_text, current_time, word, None, frame, show_original=True
-                )
-                if not continue_processing:
-                    print("Visualizer stopped by user.")
-                    cap.release()
-                    out.release()
-                    cv2.destroyAllWindows()
-                    return
-    
-    # Release resources
-    cap.release()
-    out.release()
-    
-    # Close visualization window if it was opened
-    if visualize:
-        cv2.destroyAllWindows()
-    
-    print(f"Video segments extracted to: {output_video_file}")
+    precomputed_segments = []
+    frames_needed = 0.0
+    last_end = 0
+    for seg in tqdm(word_segment_times, desc="Precomputing segment timings"):
+        start_f = seg["start"] * fps
+        end_f = seg["end"] * fps
+        start = math.floor(start_f)
+        end = math.floor(end_f)
+        frames_needed += (end_f - start_f) - (end - start)
 
-def extract_audio_segments(csv_file, audio_file, output_audio_file, fade_samples=2000):
+        # if we need to add a frame, add it to the beginning
+        if frames_needed >= 0.5 and start > last_end+1:
+            start -= 1; frames_needed -= 1
+
+        # if we need to give up a frame, remove it from the beginning
+        elif frames_needed <= -0.5:
+            start += 1; frames_needed += 1
+        last_end = end
+        precomputed_segments.append({
+            "word": seg["word"],
+            "start_frame": start,
+            "end_frame": end,
+            "start_sec": start / fps,
+            "end_sec": end / fps
+        })
+    return precomputed_segments
+
+def switch_speaker(current_speaker, current_time, entry, last_speaker_change_time,
+                   last_speaker_start_time, last_visit_times,
+                   min_stay_duration=5.0, cycle_after=8.0, last_speaker_box=None):
     """
-    Extract audio segments using NumPy for processing and pydub only for I/O.
-    Applies crossfade on every segment boundary for smooth transitions.
-    
-    Args:
-        csv_file (str): Path to CSV file with start, end, word columns
-        audio_file (str): Path to audio file
-        output_audio_file (str): Path for output audio file
-        fade_samples (int): Number of samples for crossfade (default: 128)
+    Compute the correct current speaker given time, active speaker entry, and switching rules.
+
+    Returns updated:
+      current_speaker, last_speaker_change_time, last_speaker_start_time,
+      last_speaker_box, last_visit_times
     """
-    # Read CSV file
-    df = pd.read_csv(csv_file)
+    # Determine active (currently speaking) person
+    active_speaker = next((p for p in entry.get("people", []) if p.get("speaking", False)), None)
 
-    # Load audio file once and convert to NumPy array
-    audio = AudioSegment.from_file(audio_file)
-    sample_rate = audio.frame_rate
-    channels = audio.channels
-    dtype = np.int16 if audio.sample_width == 2 else np.int8
+    should_switch = False
+    if active_speaker:
+        if current_speaker is None:
+            should_switch = True
+        elif active_speaker["id"] != current_speaker["id"]:
+            if current_time - last_speaker_change_time >= min_stay_duration:
+                should_switch = True
 
-    # Convert entire audio to NumPy array for efficient slicing
-    audio_samples = np.array(audio.get_array_of_samples(), dtype=dtype)
+    if should_switch:
+        if current_speaker:
+            last_visit_times[current_speaker["id"]] = current_time
+        current_speaker = active_speaker
+        last_speaker_change_time = current_time
+        last_speaker_start_time = current_time
+        if current_speaker:
+            last_speaker_box = current_speaker.get("box", last_speaker_box)
+            last_visit_times[current_speaker["id"]] = current_time
 
-    # Reshape to (num_samples, channels) if stereo or more
-    if channels > 1:
-        audio_samples = audio_samples.reshape((-1, channels))
+    # Auto-cycle if same person too long
+    if current_speaker and (current_time - last_speaker_start_time) >= cycle_after:
+        available = [p for p in entry["people"] if p["id"] != current_speaker["id"]]
+        if available:
+            least_recent = min(available, key=lambda p: last_visit_times.get(p["id"], 0))
+            last_visit_times[current_speaker["id"]] = current_time
+            current_speaker = least_recent
+            last_speaker_box = current_speaker.get("box", last_speaker_box)
+            last_speaker_start_time = current_time
+            last_speaker_change_time = current_time
+            last_visit_times[current_speaker["id"]] = current_time
 
-    # Initialize output as NumPy array
-    output_samples = np.empty((0, channels), dtype=dtype) if channels > 1 else np.empty(0, dtype=dtype)
-
-    # Extract segments with crossfade on every segment
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Extracting audio"):
-        start_time = row['start'] * 1000  # Convert to ms
-        end_time = row['end'] * 1000
-
-        # Calculate sample indices
-        start_sample = int(start_time * sample_rate / 1000)
-        end_sample = int(end_time * sample_rate / 1000)
-
-        # Extract segment using NumPy slicing
-        segment_samples = audio_samples[start_sample:end_sample].copy()
-
-        # Apply crossfade on every segment (not just when pops are detected)
-        if output_samples.size > 0:
-            # Use overlap region for crossfade
-            fade_len = min(fade_samples, len(output_samples), len(segment_samples))
-            
-            if fade_len > 0:
-                # Split tail of output
-                output_tail = output_samples[-fade_len:].astype(np.float32)
-                output_keep = output_samples[:-fade_len]
-
-                # Split head of segment
-                seg_head = segment_samples[:fade_len].astype(np.float32)
-                seg_rest = segment_samples[fade_len:]
-
-                # Create complementary envelopes
-                fade_out_env = np.linspace(1.0, 0.0, fade_len, dtype=np.float32)
-                fade_in_env  = np.linspace(0.0, 1.0, fade_len, dtype=np.float32)
-
-                if output_tail.ndim == 2:  # stereo/multi
-                    fade_out_env = fade_out_env[:, None]
-                    fade_in_env = fade_in_env[:, None]
-
-                # Blend overlap region
-                blended_overlap = (output_tail * fade_out_env + seg_head * fade_in_env).astype(output_samples.dtype)
-
-                # New output = keep + blended overlap + rest
-                output_samples = np.concatenate([output_keep, blended_overlap, seg_rest])
-            else:
-                # If no overlap possible, just concatenate
-                output_samples = np.concatenate([output_samples, segment_samples])
-        else:
-            # First segment, no crossfade needed
-            output_samples = segment_samples
-
-    # Convert back to AudioSegment only at the end for export
-    output_audio = AudioSegment(
-        output_samples.tobytes(),
-        frame_rate=sample_rate,
-        sample_width=audio.sample_width,
-        channels=channels
+    return (
+        current_speaker,
+        last_speaker_change_time,
+        last_speaker_start_time,
+        last_speaker_box,
+        last_visit_times
     )
 
-    # Export combined audio
-    output_audio.export(output_audio_file, format="wav")
-    print(f"✅ Audio segments extracted to: {output_audio_file}")
+def generate_frame_list(speaking_times_averaged, json_times, fps,
+                                      total_frames, precomputed_segments,
+                                      input_width=1920, input_height=1080,
+                                      output_width=480, output_height=853,
+                                      min_stay_duration=5.0, cycle_after=8.0):
+    """
+    Generate a list of frames with crop boundary information for speaker-focused extraction.
+    Includes crop boundaries calculated based on speaker bounding boxes and movement smoothing.
+    Includes word information from precomputed segments.
+    Only includes frames that are also in a segment (have word information).
+    """
+    print("Generating frame list with crop boundaries and word information...")
+    
+    # Create a mapping from frame index to word and track frames in segments
+    frame_to_word = {}
+    frames_in_segments = set()
+    for seg in precomputed_segments:
+        start_frame = seg["start_frame"]
+        end_frame = seg["end_frame"]
+        word = seg["word"]
+        for frame_idx in range(start_frame, end_frame):
+            if frame_idx < total_frames:
+                frame_to_word[frame_idx] = word
+                frames_in_segments.add(frame_idx)
+
+    # Create a list that only includes frames that are in segments
+    frame_list = []
+    
+    current_speaker = None
+    last_speaker_change_time = 0.0
+    last_speaker_start_time = 0.0
+    last_speaker_box = None
+    last_visit_times = {}
+    last_center = None
+
+    # Only process frames that are in segments
+    frames_to_process = sorted(frames_in_segments)
+    
+    for frame_idx in tqdm(frames_to_process, desc="Generating frame list"):
+        current_time = frame_idx / fps
+
+        # Find closest entry in JSON
+        idx = bisect.bisect_left(json_times, current_time)
+        if idx == 0:
+            entry = speaking_times_averaged[0]
+        elif idx == len(json_times):
+            entry = speaking_times_averaged[-1]
+        else:
+            before, after = speaking_times_averaged[idx - 1], speaking_times_averaged[idx]
+            entry = before if abs(before["time"] - current_time) <= abs(after["time"] - current_time) else after
+
+        # Use reusable switch_speaker() logic
+        current_speaker, last_speaker_change_time, last_speaker_start_time, \
+        last_speaker_box, last_visit_times = switch_speaker(
+            current_speaker,
+            current_time,
+            entry,
+            last_speaker_change_time,
+            last_speaker_start_time,
+            last_visit_times,
+            min_stay_duration,
+            cycle_after,
+            last_speaker_box
+        )
+
+        # Get word for this frame
+        current_word = frame_to_word.get(frame_idx, "")
+
+        # Calculate crop boundaries for this frame
+        crop_boundaries = None
+        if current_speaker and last_speaker_box:
+            # Calculate center of bounding box
+            target_center_x = (last_speaker_box[0] + last_speaker_box[2]) / 2
+            target_center_y = (last_speaker_box[1] + last_speaker_box[3]) / 2 + 100  # y_offset
+            
+            # Calculate screen diagonal for movement thresholds
+            screen_diagonal = np.sqrt(output_width**2 + output_height**2)
+            small_movement_threshold = 0.01 * screen_diagonal  # 1% of diagonal
+            big_movement_threshold = 0.20 * screen_diagonal    # 20% of diagonal
+            
+            # If we have a previous center, apply movement constraints
+            if last_center is not None:
+                last_center_x, last_center_y = last_center
+                
+                # Calculate distance to target
+                distance = np.sqrt((target_center_x - last_center_x)**2 + (target_center_y - last_center_y)**2)
+                
+                # Apply movement constraints
+                if distance > 0:
+                    if distance <= small_movement_threshold:
+                        # Small movement: allow it (move directly to target)
+                        center_x, center_y = target_center_x, target_center_y
+                    elif distance >= big_movement_threshold:
+                        # Big movement: allow it (move directly to target)
+                        center_x, center_y = target_center_x, target_center_y
+                    else:
+                        # Medium movement: restrict to small movement
+                        direction_x = (target_center_x - last_center_x) / distance
+                        direction_y = (target_center_y - last_center_y) / distance
+                        center_x = last_center_x + direction_x * small_movement_threshold
+                        center_y = last_center_y + direction_y * small_movement_threshold
+                else:
+                    # No movement needed
+                    center_x, center_y = last_center_x, last_center_y
+            else:
+                # No previous center, use target directly
+                center_x, center_y = target_center_x, target_center_y
+            
+            # Calculate crop boundaries
+            crop_x1 = int(center_x - output_width / 2)
+            crop_y1 = int(center_y - output_height / 2)
+            crop_x2 = int(center_x + output_width / 2)
+            crop_y2 = int(center_y + output_height / 2)
+            
+            # Ensure boundaries are valid and "doable" - stay within input frame dimensions
+            # Make sure crop region has positive dimensions
+            if crop_x2 <= crop_x1:
+                crop_x2 = crop_x1 + output_width
+            if crop_y2 <= crop_y1:
+                crop_y2 = crop_y1 + output_height
+            
+            # Ensure crop region doesn't extend beyond input video dimensions
+            crop_x1 = max(0, min(crop_x1, input_width - output_width))
+            crop_y1 = max(0, min(crop_y1, input_height - output_height))
+            crop_x2 = min(input_width, max(crop_x2, crop_x1 + output_width))
+            crop_y2 = min(input_height, max(crop_y2, crop_y1 + output_height))
+            
+            # Final validation to ensure positive dimensions
+            if crop_x2 <= crop_x1:
+                crop_x2 = crop_x1 + output_width
+            if crop_y2 <= crop_y1:
+                crop_y2 = crop_y1 + output_height
+            
+            crop_boundaries = {
+                "crop_x1": crop_x1,
+                "crop_y1": crop_y1,
+                "crop_x2": crop_x2,
+                "crop_y2": crop_y2,
+                "center_x": center_x,
+                "center_y": center_y
+            }
+            
+            last_center = (center_x, center_y)
+
+        # Record the frame information for ALL frames in segments
+        # If no current speaker, use last crop settings or center of frame
+        if not current_speaker and last_center is not None:
+            # Use last crop settings if available
+            crop_boundaries = {
+                "crop_x1": int(last_center[0] - output_width / 2),
+                "crop_y1": int(last_center[1] - output_height / 2),
+                "crop_x2": int(last_center[0] + output_width / 2),
+                "crop_y2": int(last_center[1] + output_height / 2),
+                "center_x": last_center[0],
+                "center_y": last_center[1]
+            }
+        elif not current_speaker and last_center is None:
+            # Start in center of frame if no previous settings
+            # Assume frame dimensions (will be adjusted during extraction)
+            crop_boundaries = {
+                "crop_x1": 0,
+                "crop_y1": 0,
+                "crop_x2": output_width,
+                "crop_y2": output_height,
+                "center_x": output_width / 2,
+                "center_y": output_height / 2
+            }
+        
+        frame_list.append({
+            "frame_idx": frame_idx,
+            "time": current_time,
+            "speaker_id": current_speaker["id"] if current_speaker else None,
+            "speaker_box": last_speaker_box,
+            "crop_boundaries": crop_boundaries,
+            "word": current_word
+        })
+
+    # Count frames with valid information
+    frames_with_info = len(frame_list)
+    print(f"✅ Frame list generation complete.")
+    print(f"   Total frames in video: {total_frames}")
+    print(f"   Frames in segments: {len(frames_in_segments)}")
+    print(f"   Frames included in frame list: {frames_with_info}")
+    print(f"   Frames excluded (not in segments): {total_frames - len(frames_in_segments)}")
+    return frame_list
 
 
-def combine_video_audio(video_file, audio_file, output_file):
+def extract_video_segments(
+    frame_list,
+    video_file,
+    silent_video_file,
+    output_width,
+    output_height,
+    fps,
+    font_scale=1.8,
+    visualize=False
+):
+    """
+    Efficiently extract and crop speaker-focused segments from a video.
+    Reads frames sequentially without random seeks for maximum efficiency.
+    """
+    print("🧠 Optimized sequential OpenCV frame processing (no cap.set calls)...")
+
+    cap = cv2.VideoCapture(video_file)
+    if not cap.isOpened():
+        print(f"❌ Error: Could not open video file {video_file}")
+        return
+
+    input_fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    print(f"📹 Input video: {input_width}x{input_height}, {input_fps:.2f} fps, {total_frames} frames")
+
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(silent_video_file, fourcc, fps, (output_width, output_height))
+    if not out.isOpened():
+        print(f"❌ Error: Could not create output video {silent_video_file}")
+        cap.release()
+        return
+
+    if visualize:
+        cv2.namedWindow('Extraction Visualizer', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Extraction Visualizer', 1200, 800)
+        print("Visualizer started. Press 'q' to quit, 'p' to pause.")
+
+    processed_frames = 0
+    skipped_frames = 0
+    continue_processing = True
+
+    # Ensure frame list is sorted
+    frame_list = sorted(frame_list, key=lambda f: f["frame_idx"])
+
+    target_iter = iter(frame_list)
+    current_target = next(target_iter, None)
+    current_frame_idx = 0
+    
+    # Store last 5 frames for fade transitions
+    last_frames = []
+    max_frames_to_store = 5
+    fade_frames = 5  # Number of frames to fade over
+
+    with tqdm(total=len(frame_list), desc="Processing frames") as pbar:
+        while cap.isOpened() and current_target is not None and continue_processing:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Skip frames until reaching the next target frame index
+            if current_frame_idx < current_target["frame_idx"]:
+                current_frame_idx += 1
+                continue
+
+            # Process this frame
+            frame_info = current_target
+            processed_frame = frame
+            crop_bounds = frame_info.get("crop_boundaries")
+            if crop_bounds:
+                x1, y1, x2, y2 = (
+                    crop_bounds["crop_x1"],
+                    crop_bounds["crop_y1"],
+                    crop_bounds["crop_x2"],
+                    crop_bounds["crop_y2"],
+                )
+                if x2 > x1 and y2 > y1:
+                    processed_frame = frame[y1:y2, x1:x2]
+
+            if processed_frame.shape[1] != output_width or processed_frame.shape[0] != output_height:
+                processed_frame = cv2.resize(processed_frame, (output_width, output_height))
+
+            word = frame_info.get("word", "")
+            processed_frame = add_text_with_shadow(processed_frame, word, font_scale=font_scale)
+            
+            # Write the current frame
+            out.write(processed_frame)
+            processed_frames += 1
+            pbar.update(1)
+            
+            # Store current frame for future transitions
+            last_frames.append(processed_frame.copy())
+            if len(last_frames) > max_frames_to_store:
+                last_frames.pop(0)
+
+            # Visualization
+            if visualize:
+                original = frame.copy()
+                current_time = frame_info["frame_idx"] / input_fps
+                speaker_info = {
+                    "id": frame_info.get("speaker_id", "unknown"),
+                    "box": frame_info.get("speaker_box")
+                }
+                continue_processing = visualize_extraction_process(
+                    processed_frame,
+                    current_time,
+                    word,
+                    speaker_info,
+                    original,
+                    show_original=True
+                )
+                if not continue_processing:
+                    print("Visualization stopped by user.")
+                    break
+
+            # Move to next target frame
+            current_target = next(target_iter, None)
+            current_frame_idx += 1
+
+    cap.release()
+    out.release()
+    if visualize:
+        cv2.destroyAllWindows()
+
+    print(f"✅ Processing complete. Processed {processed_frames}, skipped {skipped_frames}.")
+    verify = cv2.VideoCapture(silent_video_file)
+    print(f"   Output frames: {int(verify.get(cv2.CAP_PROP_FRAME_COUNT))}")
+    verify.release()
+
+def combine_video_audio(video_file, audio_file, final_output):
     """
     Combine video and audio files using ffmpeg.
     
@@ -792,12 +822,12 @@ def combine_video_audio(video_file, audio_file, output_file):
         '-c:a', 'aac',
         '-strict', 'experimental',
         '-y',  # Overwrite output file if it exists
-        output_file
+        final_output
     ]
     
     try:
         subprocess.run(cmd, check=True)
-        print(f"Video and audio combined to: {output_file}")
+        print(f"Video and audio combined to: {final_output}")
     except subprocess.CalledProcessError as e:
         print(f"Error combining video and audio: {e}")
         return False
@@ -809,17 +839,23 @@ def main():
     
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Extract video segments based on CSV with optional JSON cropping')
-    parser.add_argument('--json', type=str, help='JSON file with bounding box data for speaker cropping')
+    parser.add_argument('--speaking_times', type=str, help='JSON file with bounding box data for speaker cropping')
     parser.add_argument('--csv', type=str, default='words.csv', help='CSV file with time segments (default: words.csv)')
     parser.add_argument('--video', type=str, default='deblurred.mp4', help='Input video file (default: deblurred.mp4)')
     parser.add_argument('--audio', type=str, default='GBRvid4_audio.wav', help='Input audio file (default: GBRvid4_audio.wav)')
     parser.add_argument('--width', type=int, default=640, help='Output window width (default: 640)')
     parser.add_argument('--height', type=int, default=480, help='Output window height (default: 480)')
-    parser.add_argument('--output', type=str, default='final_output.mp4', help='Output video file (default: final_output.mp4)')
+    parser.add_argument('--cycle-after', type=int, default=8, help='How long to cycle off of an active speaker')
     parser.add_argument('--visualize', action='store_true', help='Show real-time visualization of extraction process')
     parser.add_argument('--font-scale', type=float, default=4.0, help='Font scale for text overlay (default: 4.0)')
     parser.add_argument('--min-stay-duration', type=float, default=5, help='Minimum time in seconds to stay on a person after switching target (default: 1.5)')
-    parser.add_argument('--audio-only', action='store_true', help='Extract audio only without video processing')
+    parser.add_argument('--no-video', action='store_true', help='Skip video processing')
+    parser.add_argument('--no-audio', action='store_true', help='Skip audio processing')
+    parser.add_argument('--no-combine', action='store_true', help='Skip combine')
+    parser.add_argument('--save-lengths', action='store_true', help='Save segment lengths summary file')
+    parser.add_argument('--fade-samples', type=int, default=3000,
+                        help='Crossfade length in samples for audio stitching (default: 256)')
+
     
     args = parser.parse_args()
     
@@ -827,7 +863,8 @@ def main():
     csv_file = args.csv
     video_file = args.video
     audio_file = args.audio
-    final_output = args.output
+    final_output = video_file + "_final.mp4"
+    output_audio_file = audio_file+"_extracted.wav"
     
     # Check if files exist
     if not os.path.exists(csv_file):
@@ -840,65 +877,79 @@ def main():
     
     print("Starting video/audio extraction...")
     
-    temp_output_audio = "temp_output_audio.wav"
-    temp_output_video = "temp_output_video_cropped.mp4"
+    audio = AudioSegment.from_file(audio_file)
+    sr = audio.frame_rate
+    
+    # --- Load CSV + JSON ---
+    word_segment_times_df = pd.read_csv(csv_file)
+    # align all times to audio sample boundaries
+    word_segment_times_df["start"] = (word_segment_times_df["start"] * sr).astype(int) / sr
+    word_segment_times_df["end"] = (word_segment_times_df["end"] * sr).astype(int) / sr
+    # Convert DataFrame to list of dictionaries for easier processing
+    word_segment_times = word_segment_times_df.to_dict('records')
+    word_segment_times = fix_zero_length_words(word_segment_times, sr)
 
-    # Audio-only mode
-    if args.audio_only:
-        print("\n=== Extracting Audio Segments (Audio Only Mode) ===")
-        extract_audio_segments(csv_file, audio_file, temp_output_audio)
-        print(f"\n✅ Audio output created: {temp_output_audio}")
-        # Combine video and audio
-        print("\n=== Combining Video and Audio ===")
-        if combine_video_audio(temp_output_video, temp_output_audio, final_output):
-            print(f"\n✅ Final output created: {final_output}")
-            print("Note: Temporary files (output_video_cropped.mp4, output_audio.wav) were not cleaned up")
-        else:
-            print("\n❌ Failed to create final output")
-        return
+    with open(args.speaking_times, 'r') as f:
+        speaking_times = json.load(f)
+
+    if not args.no_audio:
+        print("\n=== Extracting Audio Segments ===")
+        extract_audio_segments(word_segment_times, audio_file, output_audio_file, fade_samples=args.fade_samples)
+
     
     # Check video file only if not in audio-only mode
     if not os.path.exists(video_file):
         print(f"Error: Video file '{video_file}' not found")
         return
     
-    if args.json:
-        # Combined mode - use CSV for time segments and JSON for speaker cropping
-        if not os.path.exists(args.json):
-            print(f"Error: JSON file '{args.json}' not found")
-            return
+    silent_video_file = video_file + "_cropped.mp4"
+
+    if not args.no_video:
+        total_frames = int(cv2.VideoCapture(video_file).get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = probe_fps(video_file)
+        precomputed_segments = precompute_segments(word_segment_times, fps)
+        speaking_times_averaged, json_times = preprocess_speaker_data(speaking_times)
+        # Get input video dimensions
+        cap = cv2.VideoCapture(video_file)
+        input_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        input_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
         
-        print("\n=== Extracting Video Segments with Speaker Cropping (Combined Mode) ===")
-        extract_video_segments_with_cropping(csv_file, args.json, video_file, temp_output_video, args.width, args.height, visualize=args.visualize, font_scale=args.font_scale, min_stay_duration=args.min_stay_duration)
+        frame_number_and_bounds = generate_frame_list(
+            speaking_times_averaged,
+            json_times,
+            fps,
+            total_frames,
+            precomputed_segments,
+            input_width=input_width,
+            input_height=input_height,
+            cycle_after=args.cycle_after,
+            output_width=args.width,
+            output_height=args.height
+        )
+        # Convert to serializable format
+        serializable_list = []
+        for frame_info in frame_number_and_bounds:
+            if frame_info is not None:
+                serializable_list.append(frame_info)
+        # Write frame list to file for inspection
+        with open("frame_number_and_bounds.json", "w") as f:
+            json.dump(serializable_list, f, indent=2)
+        print("✅ Frame list written to frame_number_and_bounds.json")
         
-        print("\n=== Extracting Audio Segments ===")
-        extract_audio_segments(csv_file, audio_file, temp_output_audio)
-        
-        # Combine video and audio
+        extract_video_segments(
+            frame_number_and_bounds,
+            video_file,
+            silent_video_file,
+            output_width=args.width,
+            output_height=args.height,
+            fps=fps,
+            visualize=args.visualize
+        )
+
+    if not args.no_combine:
         print("\n=== Combining Video and Audio ===")
-        if combine_video_audio(temp_output_video, temp_output_audio, final_output):
-            print(f"\n✅ Final output created: {final_output}")
-            print("Note: Temporary files (output_video_cropped.mp4, output_audio.wav) were not cleaned up")
-        else:
-            print("\n❌ Failed to create final output")
-    
-    else:
-        # CSV mode - original functionality (no cropping)
-        print("\n=== Extracting Video Segments (CSV Mode - No Cropping) ===")
-        temp_output_video = "output_video.mp4"
-        extract_video_segments(csv_file, video_file, temp_output_video, visualize=args.visualize, font_scale=args.font_scale)
-        
-        print("\n=== Extracting Audio Segments ===")
-        temp_output_audio = "output_audio.wav"
-        extract_audio_segments(csv_file, audio_file, temp_output_audio)
-        
-        # Combine video and audio
-        print("\n=== Combining Video and Audio ===")
-        if combine_video_audio(temp_output_video, temp_output_audio, final_output):
-            print(f"\n✅ Final output created: {final_output}")
-            print("Note: Temporary files (output_video.mp4, output_audio.wav) were not cleaned up")
-        else:
-            print("\n❌ Failed to create final output")
+        combine_video_audio(silent_video_file, output_audio_file, final_output)
 
 if __name__ == "__main__":
     main()

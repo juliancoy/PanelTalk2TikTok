@@ -11,7 +11,7 @@ def export_words_to_csv(json_file, csv_file):
     # Open CSV for writing
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["start", "end", "word"])  # header row
+        writer.writerow(["speaker", "start", "end", "word"])  # header row
 
         # Iterate over segments and words
         for segment in data.get("segments", []):

@@ -7,3 +7,4 @@ data_offset
 output
 *.wav
 *.txt
+*__pycache__
