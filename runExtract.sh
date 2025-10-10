@@ -1,0 +1,1 @@
+python extract_segments.py --speaking_times inner_lip_movement.json --csv GBRvid1-002_audio.json.csv --video GBRvid1_deblurred.mp4 --audio GBRvid1-002_audio.wav --width 480 --height 853 --font-scale 1.8 --min-stay-duration 3 --cycle-after 10 --save-lengths --fade-samples 1500

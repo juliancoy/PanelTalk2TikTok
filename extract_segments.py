@@ -90,7 +90,7 @@ def extract_audio_segments(word_segment_times, audio_file, output_audio_file, fa
     return output_audio_file
 
 
-def add_text_with_shadow(frame, text, font_scale=4.0):
+def add_text_with_shadow(frame, text, font_scale=4.0, text_height_from_bottom = 300):
     """
     Add text with drop shadow to a frame, centered at the bottom like closed captions.
     
@@ -116,7 +116,7 @@ def add_text_with_shadow(frame, text, font_scale=4.0):
     
     # Position text at bottom center (like closed captions)
     x = (width - text_width) // 2
-    y = height - 150  # Position from bottom
+    y = height - text_height_from_bottom  # Position from bottom
     
     # Add drop shadow (darker text slightly offset)
     shadow_offset = 3
@@ -357,7 +357,7 @@ def preprocess_speaker_data(speaking_times, window_size=3.0):
 
 import numpy as np
 
-def fix_zero_length_words(word_segment_times, sr, preappend_budget=0.2):
+def fix_zero_length_words(word_segment_times, sr, preappend_budget=0.2, shift_seconds = 0.15):
     """
     word_segment_times: list[dict], each dict at least has {"start": float, "end": float, ...}
     Mutates a copy of the list and returns it.
@@ -371,6 +371,15 @@ def fix_zero_length_words(word_segment_times, sr, preappend_budget=0.2):
     for i in range(1, len(word_segment_times)):
         prev = out[-1]                               # previous (already possibly adjusted)
         curr = dict(word_segment_times[i])           # copy current
+        # apply shift
+        curr["start"] = curr["start"] - shift_seconds
+
+        #lengthening is ok
+        if i < len(word_segment_times) -1:
+            curr["end"] = min(curr["end"], word_segment_times[i+1]["start"]- shift_seconds)
+
+        if curr["start"] < 0:
+            continue
 
         curr_len = curr["end"] - curr["start"]
         if curr_len <= 0:
@@ -498,18 +507,6 @@ def generate_frame_list(speaking_times_averaged, json_times, fps,
     """
     print("Generating frame list with crop boundaries and word information...")
     
-    # Create a mapping from frame index to word and track frames in segments
-    frame_to_word = {}
-    frames_in_segments = set()
-    for seg in precomputed_segments:
-        start_frame = seg["start_frame"]
-        end_frame = seg["end_frame"]
-        word = seg["word"]
-        for frame_idx in range(start_frame, end_frame):
-            if frame_idx < total_frames:
-                frame_to_word[frame_idx] = word
-                frames_in_segments.add(frame_idx)
-
     # Create a list that only includes frames that are in segments
     frame_list = []
     
@@ -519,156 +516,157 @@ def generate_frame_list(speaking_times_averaged, json_times, fps,
     last_speaker_box = None
     last_visit_times = {}
     last_center = None
+    frames_with_info = 0
 
-    # Only process frames that are in segments
-    frames_to_process = sorted(frames_in_segments)
-    
-    for frame_idx in tqdm(frames_to_process, desc="Generating frame list"):
-        current_time = frame_idx / fps
+    for seg in tqdm(precomputed_segments, desc="Generating frame list"):
+        seg_list = []
+        start_frame = seg["start_frame"]
+        end_frame = seg["end_frame"]
+        word = seg["word"]
+        for frame_idx in range(start_frame, end_frame):
+            current_time = frame_idx / fps
 
-        # Find closest entry in JSON
-        idx = bisect.bisect_left(json_times, current_time)
-        if idx == 0:
-            entry = speaking_times_averaged[0]
-        elif idx == len(json_times):
-            entry = speaking_times_averaged[-1]
-        else:
-            before, after = speaking_times_averaged[idx - 1], speaking_times_averaged[idx]
-            entry = before if abs(before["time"] - current_time) <= abs(after["time"] - current_time) else after
-
-        # Use reusable switch_speaker() logic
-        current_speaker, last_speaker_change_time, last_speaker_start_time, \
-        last_speaker_box, last_visit_times = switch_speaker(
-            current_speaker,
-            current_time,
-            entry,
-            last_speaker_change_time,
-            last_speaker_start_time,
-            last_visit_times,
-            min_stay_duration,
-            cycle_after,
-            last_speaker_box
-        )
-
-        # Get word for this frame
-        current_word = frame_to_word.get(frame_idx, "")
-
-        # Calculate crop boundaries for this frame
-        crop_boundaries = None
-        if current_speaker and last_speaker_box:
-            # Calculate center of bounding box
-            target_center_x = (last_speaker_box[0] + last_speaker_box[2]) / 2
-            target_center_y = (last_speaker_box[1] + last_speaker_box[3]) / 2 + 100  # y_offset
-            
-            # Calculate screen diagonal for movement thresholds
-            screen_diagonal = np.sqrt(output_width**2 + output_height**2)
-            small_movement_threshold = 0.01 * screen_diagonal  # 1% of diagonal
-            big_movement_threshold = 0.20 * screen_diagonal    # 20% of diagonal
-            
-            # If we have a previous center, apply movement constraints
-            if last_center is not None:
-                last_center_x, last_center_y = last_center
-                
-                # Calculate distance to target
-                distance = np.sqrt((target_center_x - last_center_x)**2 + (target_center_y - last_center_y)**2)
-                
-                # Apply movement constraints
-                if distance > 0:
-                    if distance <= small_movement_threshold:
-                        # Small movement: allow it (move directly to target)
-                        center_x, center_y = target_center_x, target_center_y
-                    elif distance >= big_movement_threshold:
-                        # Big movement: allow it (move directly to target)
-                        center_x, center_y = target_center_x, target_center_y
-                    else:
-                        # Medium movement: restrict to small movement
-                        direction_x = (target_center_x - last_center_x) / distance
-                        direction_y = (target_center_y - last_center_y) / distance
-                        center_x = last_center_x + direction_x * small_movement_threshold
-                        center_y = last_center_y + direction_y * small_movement_threshold
-                else:
-                    # No movement needed
-                    center_x, center_y = last_center_x, last_center_y
+            # Find closest entry in JSON
+            idx = bisect.bisect_left(json_times, current_time)
+            if idx == 0:
+                entry = speaking_times_averaged[0]
+            elif idx == len(json_times):
+                entry = speaking_times_averaged[-1]
             else:
-                # No previous center, use target directly
-                center_x, center_y = target_center_x, target_center_y
-            
-            # Calculate crop boundaries
-            crop_x1 = int(center_x - output_width / 2)
-            crop_y1 = int(center_y - output_height / 2)
-            crop_x2 = int(center_x + output_width / 2)
-            crop_y2 = int(center_y + output_height / 2)
-            
-            # Ensure boundaries are valid and "doable" - stay within input frame dimensions
-            # Make sure crop region has positive dimensions
-            if crop_x2 <= crop_x1:
-                crop_x2 = crop_x1 + output_width
-            if crop_y2 <= crop_y1:
-                crop_y2 = crop_y1 + output_height
-            
-            # Ensure crop region doesn't extend beyond input video dimensions
-            crop_x1 = max(0, min(crop_x1, input_width - output_width))
-            crop_y1 = max(0, min(crop_y1, input_height - output_height))
-            crop_x2 = min(input_width, max(crop_x2, crop_x1 + output_width))
-            crop_y2 = min(input_height, max(crop_y2, crop_y1 + output_height))
-            
-            # Final validation to ensure positive dimensions
-            if crop_x2 <= crop_x1:
-                crop_x2 = crop_x1 + output_width
-            if crop_y2 <= crop_y1:
-                crop_y2 = crop_y1 + output_height
-            
-            crop_boundaries = {
-                "crop_x1": crop_x1,
-                "crop_y1": crop_y1,
-                "crop_x2": crop_x2,
-                "crop_y2": crop_y2,
-                "center_x": center_x,
-                "center_y": center_y
-            }
-            
-            last_center = (center_x, center_y)
+                before, after = speaking_times_averaged[idx - 1], speaking_times_averaged[idx]
+                entry = before if abs(before["time"] - current_time) <= abs(after["time"] - current_time) else after
 
-        # Record the frame information for ALL frames in segments
-        # If no current speaker, use last crop settings or center of frame
-        if not current_speaker and last_center is not None:
-            # Use last crop settings if available
-            crop_boundaries = {
-                "crop_x1": int(last_center[0] - output_width / 2),
-                "crop_y1": int(last_center[1] - output_height / 2),
-                "crop_x2": int(last_center[0] + output_width / 2),
-                "crop_y2": int(last_center[1] + output_height / 2),
-                "center_x": last_center[0],
-                "center_y": last_center[1]
-            }
-        elif not current_speaker and last_center is None:
-            # Start in center of frame if no previous settings
-            # Assume frame dimensions (will be adjusted during extraction)
-            crop_boundaries = {
-                "crop_x1": 0,
-                "crop_y1": 0,
-                "crop_x2": output_width,
-                "crop_y2": output_height,
-                "center_x": output_width / 2,
-                "center_y": output_height / 2
-            }
-        
-        frame_list.append({
-            "frame_idx": frame_idx,
-            "time": current_time,
-            "speaker_id": current_speaker["id"] if current_speaker else None,
-            "speaker_box": last_speaker_box,
-            "crop_boundaries": crop_boundaries,
-            "word": current_word
-        })
+            # Use reusable switch_speaker() logic
+            current_speaker, last_speaker_change_time, last_speaker_start_time, \
+            last_speaker_box, last_visit_times = switch_speaker(
+                current_speaker,
+                current_time,
+                entry,
+                last_speaker_change_time,
+                last_speaker_start_time,
+                last_visit_times,
+                min_stay_duration,
+                cycle_after,
+                last_speaker_box
+            )
 
+            # Get word for this frame
+            current_word = word
+
+            # Calculate crop boundaries for this frame
+            crop_boundaries = None
+            if current_speaker and last_speaker_box:
+                # Calculate center of bounding box
+                target_center_x = (last_speaker_box[0] + last_speaker_box[2]) / 2
+                target_center_y = (last_speaker_box[1] + last_speaker_box[3]) / 2 + 100  # y_offset
+                
+                # Calculate screen diagonal for movement thresholds
+                screen_diagonal = np.sqrt(output_width**2 + output_height**2)
+                small_movement_threshold = 0.01 * screen_diagonal  # 1% of diagonal
+                big_movement_threshold = 0.20 * screen_diagonal    # 20% of diagonal
+                
+                # If we have a previous center, apply movement constraints
+                if last_center is not None:
+                    last_center_x, last_center_y = last_center
+                    
+                    # Calculate distance to target
+                    distance = np.sqrt((target_center_x - last_center_x)**2 + (target_center_y - last_center_y)**2)
+                    
+                    # Apply movement constraints
+                    if distance > 0:
+                        if distance <= small_movement_threshold:
+                            # Small movement: allow it (move directly to target)
+                            center_x, center_y = target_center_x, target_center_y
+                        elif distance >= big_movement_threshold:
+                            # Big movement: allow it (move directly to target)
+                            center_x, center_y = target_center_x, target_center_y
+                        else:
+                            # Medium movement: restrict to small movement
+                            direction_x = (target_center_x - last_center_x) / distance
+                            direction_y = (target_center_y - last_center_y) / distance
+                            center_x = last_center_x + direction_x * small_movement_threshold
+                            center_y = last_center_y + direction_y * small_movement_threshold
+                    else:
+                        # No movement needed
+                        center_x, center_y = last_center_x, last_center_y
+                else:
+                    # No previous center, use target directly
+                    center_x, center_y = target_center_x, target_center_y
+                
+                # Calculate crop boundaries
+                crop_x1 = int(center_x - output_width / 2)
+                crop_y1 = int(center_y - output_height / 2)
+                crop_x2 = int(center_x + output_width / 2)
+                crop_y2 = int(center_y + output_height / 2)
+                
+                # Ensure boundaries are valid and "doable" - stay within input frame dimensions
+                # Make sure crop region has positive dimensions
+                if crop_x2 <= crop_x1:
+                    crop_x2 = crop_x1 + output_width
+                if crop_y2 <= crop_y1:
+                    crop_y2 = crop_y1 + output_height
+                
+                # Ensure crop region doesn't extend beyond input video dimensions
+                crop_x1 = max(0, min(crop_x1, input_width - output_width))
+                crop_y1 = max(0, min(crop_y1, input_height - output_height))
+                crop_x2 = min(input_width, max(crop_x2, crop_x1 + output_width))
+                crop_y2 = min(input_height, max(crop_y2, crop_y1 + output_height))
+                
+                # Final validation to ensure positive dimensions
+                if crop_x2 <= crop_x1:
+                    crop_x2 = crop_x1 + output_width
+                if crop_y2 <= crop_y1:
+                    crop_y2 = crop_y1 + output_height
+                
+                crop_boundaries = {
+                    "crop_x1": crop_x1,
+                    "crop_y1": crop_y1,
+                    "crop_x2": crop_x2,
+                    "crop_y2": crop_y2,
+                    "center_x": center_x,
+                    "center_y": center_y
+                }
+                
+                last_center = (center_x, center_y)
+
+            # Record the frame information for ALL frames in segments
+            # If no current speaker, use last crop settings or center of frame
+            if not current_speaker and last_center is not None:
+                # Use last crop settings if available
+                crop_boundaries = {
+                    "crop_x1": int(last_center[0] - output_width / 2),
+                    "crop_y1": int(last_center[1] - output_height / 2),
+                    "crop_x2": int(last_center[0] + output_width / 2),
+                    "crop_y2": int(last_center[1] + output_height / 2),
+                    "center_x": last_center[0],
+                    "center_y": last_center[1]
+                }
+            elif not current_speaker and last_center is None:
+                # Start in center of frame if no previous settings
+                # Assume frame dimensions (will be adjusted during extraction)
+                crop_boundaries = {
+                    "crop_x1": 0,
+                    "crop_y1": 0,
+                    "crop_x2": output_width,
+                    "crop_y2": output_height,
+                    "center_x": output_width / 2,
+                    "center_y": output_height / 2
+                }
+            
+            seg_list.append({
+                "frame_idx": frame_idx,
+                "time": current_time,
+                "speaker_id": current_speaker["id"] if current_speaker else None,
+                "speaker_box": last_speaker_box,
+                "crop_boundaries": crop_boundaries,
+                "word": current_word
+            })
+            frames_with_info += 1
+        frame_list.append(seg_list)
     # Count frames with valid information
-    frames_with_info = len(frame_list)
     print(f"✅ Frame list generation complete.")
     print(f"   Total frames in video: {total_frames}")
-    print(f"   Frames in segments: {len(frames_in_segments)}")
     print(f"   Frames included in frame list: {frames_with_info}")
-    print(f"   Frames excluded (not in segments): {total_frames - len(frames_in_segments)}")
     return frame_list
 
 
@@ -680,13 +678,15 @@ def extract_video_segments(
     output_height,
     fps,
     font_scale=1.8,
-    visualize=False
+    visualize=False,
+    fade_frames=4,
+    text_height=300
 ):
     """
     Efficiently extract and crop speaker-focused segments from a video.
-    Reads frames sequentially without random seeks for maximum efficiency.
+    Smoothly fades between segments using crossfade blending.
     """
-    print("🧠 Optimized sequential OpenCV frame processing (no cap.set calls)...")
+    print("🧠 Optimized sequential OpenCV frame processing (with smooth fades)...")
 
     cap = cv2.VideoCapture(video_file)
     if not cap.isOpened():
@@ -713,61 +713,79 @@ def extract_video_segments(
         print("Visualizer started. Press 'q' to quit, 'p' to pause.")
 
     processed_frames = 0
-    skipped_frames = 0
-    continue_processing = True
-
-    # Ensure frame list is sorted
-    frame_list = sorted(frame_list, key=lambda f: f["frame_idx"])
-
-    target_iter = iter(frame_list)
-    current_target = next(target_iter, None)
     current_frame_idx = 0
-    
-    # Store last 5 frames for fade transitions
-    last_frames = []
-    max_frames_to_store = 5
-    fade_frames = 5  # Number of frames to fade over
+    frame_buffer = []
+    fadeout_frames = []
 
-    with tqdm(total=len(frame_list), desc="Processing frames") as pbar:
-        while cap.isOpened() and current_target is not None and continue_processing:
-            ret, frame = cap.read()
-            if not ret:
-                break
-
-            # Skip frames until reaching the next target frame index
-            if current_frame_idx < current_target["frame_idx"]:
+    for seg in tqdm(frame_list):
+        # Process all frames in this segment
+        fadeout_len = min(fade_frames, len(seg))
+        possible_fadein_frames = len(seg[:-fadeout_len])
+        for frame_info in seg[:-fadeout_len]:
+            # Skip ahead to the next frame index
+            while current_frame_idx <= frame_info["frame_idx"]:
+                ret, frame = cap.read()
                 current_frame_idx += 1
-                continue
 
-            # Process this frame
-            frame_info = current_target
-            processed_frame = frame
-            crop_bounds = frame_info.get("crop_boundaries")
-            if crop_bounds:
-                x1, y1, x2, y2 = (
-                    crop_bounds["crop_x1"],
-                    crop_bounds["crop_y1"],
-                    crop_bounds["crop_x2"],
-                    crop_bounds["crop_y2"],
-                )
-                if x2 > x1 and y2 > y1:
-                    processed_frame = frame[y1:y2, x1:x2]
+                crop_bounds = frame_info.get("crop_boundaries")
+                if crop_bounds:
+                    x1, y1, x2, y2 = (
+                        crop_bounds["crop_x1"],
+                        crop_bounds["crop_y1"],
+                        crop_bounds["crop_x2"],
+                        crop_bounds["crop_y2"],
+                    )
+                    if x2 > x1 and y2 > y1:
+                        frame = frame[y1:y2, x1:x2]
+                
+                frame_buffer.append(frame)
+                if len(frame_buffer) > fade_frames+1:
+                    frame_buffer.pop(0)
 
-            if processed_frame.shape[1] != output_width or processed_frame.shape[0] != output_height:
-                processed_frame = cv2.resize(processed_frame, (output_width, output_height))
+            # if there are leftover frames, blend and write
+            while len(fadeout_frames) > possible_fadein_frames:
+                out.write(fadeout_frames.pop(0)[0])
 
+            while len(fadeout_frames) > fade_frames:
+                out.write(fadeout_frames.pop(0)[0])
+
+            fade_len = len(fadeout_frames)
+
+            for i, frame_and_word in enumerate(fadeout_frames):
+                fadeout_frame, word = frame_and_word
+                alpha = i / float(fade_len)
+                frame = cv2.addWeighted(fadeout_frame, 1 - alpha, frame_buffer[-fade_len+i], alpha, 0)
+                frame = add_text_with_shadow(frame, word, font_scale=font_scale, text_height_from_bottom = text_height)
+                out.write(frame)
+
+                # Visualization
+                if visualize:
+                    original = frame.copy()
+                    current_time = frame_info["frame_idx"] / input_fps
+                    speaker_info = {
+                        "id": frame_info.get("speaker_id", "unknown"),
+                        "box": frame_info.get("speaker_box")
+                    }
+                    continue_processing = visualize_extraction_process(
+                        frame,
+                        current_time,
+                        word,
+                        speaker_info,
+                        original,
+                        show_original=True
+                    )
+                    if not continue_processing:
+                        print("Visualization stopped by user.")
+                        break
+                    
+            fadeout_frames = []
+            # Resize and annotate
+            frame = cv2.resize(frame, (output_width, output_height))
             word = frame_info.get("word", "")
-            processed_frame = add_text_with_shadow(processed_frame, word, font_scale=font_scale)
-            
-            # Write the current frame
-            out.write(processed_frame)
-            processed_frames += 1
-            pbar.update(1)
-            
-            # Store current frame for future transitions
-            last_frames.append(processed_frame.copy())
-            if len(last_frames) > max_frames_to_store:
-                last_frames.pop(0)
+            frame = add_text_with_shadow(frame, word, font_scale=font_scale)
+
+            # Add to current segment buffer
+            out.write(frame)
 
             # Visualization
             if visualize:
@@ -778,7 +796,7 @@ def extract_video_segments(
                     "box": frame_info.get("speaker_box")
                 }
                 continue_processing = visualize_extraction_process(
-                    processed_frame,
+                    frame,
                     current_time,
                     word,
                     speaker_info,
@@ -789,19 +807,48 @@ def extract_video_segments(
                     print("Visualization stopped by user.")
                     break
 
-            # Move to next target frame
-            current_target = next(target_iter, None)
+        for frame_info in seg[-fadeout_len:]:
+
+            ret, frame = cap.read()
             current_frame_idx += 1
+
+            crop_bounds = frame_info.get("crop_boundaries")
+            if crop_bounds:
+                x1, y1, x2, y2 = (
+                    crop_bounds["crop_x1"],
+                    crop_bounds["crop_y1"],
+                    crop_bounds["crop_x2"],
+                    crop_bounds["crop_y2"],
+                )
+                if x2 > x1 and y2 > y1:
+                    frame = frame[y1:y2, x1:x2]
+            
+            frame_buffer.append(frame)
+            if len(frame_buffer) > fade_frames:
+                frame_buffer.pop(0)
+
+            # Resize and annotate
+            frame = cv2.resize(frame, (output_width, output_height))
+            word = frame_info.get("word", "")
+            frame = add_text_with_shadow(frame, word, font_scale=font_scale)
+
+            fadeout_frames.append([frame, word])
+
+    for frame_and_word in fadeout_frames:
+        frame, word = frame_and_word
+        frame = add_text_with_shadow(frame, word, font_scale=font_scale)
+        out.write(frame)
 
     cap.release()
     out.release()
     if visualize:
         cv2.destroyAllWindows()
 
-    print(f"✅ Processing complete. Processed {processed_frames}, skipped {skipped_frames}.")
+    print(f"✅ Processing complete. Processed {processed_frames} frames total.")
     verify = cv2.VideoCapture(silent_video_file)
     print(f"   Output frames: {int(verify.get(cv2.CAP_PROP_FRAME_COUNT))}")
     verify.release()
+
 
 def combine_video_audio(video_file, audio_file, final_output):
     """
@@ -855,6 +902,13 @@ def main():
     parser.add_argument('--save-lengths', action='store_true', help='Save segment lengths summary file')
     parser.add_argument('--fade-samples', type=int, default=3000,
                         help='Crossfade length in samples for audio stitching (default: 256)')
+    parser.add_argument('--fade-frames', type=int, default=6,
+                        help='Crossfade length in Crossfade for video stitching (default: 6)')
+    parser.add_argument('--text-height', type=int, default=300,
+                        help='Height of test above bottom')
+    parser.add_argument('--shift-seconds', type=int, default=0.15,
+                        help='sometimes A/V is aligned but the segment times are shifted (thanks, whisper)')
+
 
     
     args = parser.parse_args()
@@ -887,7 +941,7 @@ def main():
     word_segment_times_df["end"] = (word_segment_times_df["end"] * sr).astype(int) / sr
     # Convert DataFrame to list of dictionaries for easier processing
     word_segment_times = word_segment_times_df.to_dict('records')
-    word_segment_times = fix_zero_length_words(word_segment_times, sr)
+    word_segment_times = fix_zero_length_words(word_segment_times, sr, shift_seconds=args.shift_seconds)
 
     with open(args.speaking_times, 'r') as f:
         speaking_times = json.load(f)
@@ -944,7 +998,9 @@ def main():
             output_width=args.width,
             output_height=args.height,
             fps=fps,
-            visualize=args.visualize
+            visualize=args.visualize,
+            fade_frames=args.fade_frames,
+            text_height=args.text_height
         )
 
     if not args.no_combine:
