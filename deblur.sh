@@ -1,8 +1,9 @@
 CUDA_VISIBLE_DEVICES=0 \
 python IFAN/run.py \
-  --mode IFAN_44 \
+  --mode IFAN \
   --network IFAN \
-  --config config_IFAN_44 \
+  --config config_IFAN \
   --data folder \
-  --ckpt_abs_name IFAN/ckpt/IFAN_44.pytorch \
-  --data_offset "$1"
+  --ckpt_abs_name IFAN/ckpt/IFAN.pytorch \
+  --data_offset "$1" \
+  --batch_size "${2:-1}"

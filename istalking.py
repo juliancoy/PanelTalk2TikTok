@@ -11,7 +11,7 @@ import argparse
 import json
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 import cv2
 import numpy as np
@@ -142,41 +142,54 @@ def draw_overlay(frame, width, height, people, matched_landmarks):
         if matched_landmarks and i < len(matched_landmarks):
             draw_all_landmarks(frame, matched_landmarks[i], width, height)
 
-# ------------------------------- Main ---------------------------------
-def main():
-    ap = argparse.ArgumentParser(description="Speaking Detector (lip opening rate)")
-    ap.add_argument("--video", required=True, help="Input video path")
-    ap.add_argument("--out", default="inner_lip_movement.json", help="Output JSON path")
-    ap.add_argument("--max-faces", type=int, default=10)
-    ap.add_argument("--every-n", type=int, default=1)
-    ap.add_argument("--show", action="store_true")
-    ap.add_argument("--viz-inner-lip", action="store_true")
-    ap.add_argument("--buffer-frames", type=int, default=30,
-                    help="Buffer length in frames")
-    ap.add_argument("--detection-confidence", type=float, default=0.2,
-                    help="Minimum detection confidence for face detection (default: 0.2)")
-    ap.add_argument("--tracking-confidence", type=float, default=0.2,
-                    help="Minimum tracking confidence for face detection (default: 0.2)")
-    args = ap.parse_args()
-
-    cap = cv2.VideoCapture(args.video)
+# ---------------------------- Main Function ----------------------------
+def analyze_video(
+    video_path: str,
+    output_path: Optional[str] = None,
+    max_faces: int = 10,
+    every_n: int = 1,
+    show: bool = False,
+    viz_inner_lip: bool = False,
+    buffer_frames: int = 30,
+    detection_confidence: float = 0.2,
+    tracking_confidence: float = 0.2
+) -> str:
+    """
+    Analyze a video for speaking activity using lip movement detection.
+    
+    Args:
+        video_path: Path to input video file
+        output_path: Output JSON file path (default: <video>.json)
+        max_faces: Maximum number of faces to detect
+        every_n: Process every nth frame
+        show: Show visualization during processing
+        viz_inner_lip: Visualize inner lip landmarks
+        buffer_frames: Buffer length in frames
+        detection_confidence: Minimum detection confidence for face detection
+        tracking_confidence: Minimum tracking confidence for face detection
+    
+    Returns:
+        Path to the output JSON file
+    """
+    
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        raise SystemExit(f"Could not open: {args.video}")
+        raise SystemExit(f"Could not open: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    print(f"Video: {args.video} ({width}x{height}, {fps:.1f} FPS)")
+    print(f"Video: {video_path} ({width}x{height}, {fps:.1f} FPS)")
 
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
         static_image_mode=False,
-        max_num_faces=args.max_faces,
+        max_num_faces=max_faces,
         refine_landmarks=True,
-        min_detection_confidence=args.detection_confidence,
-        min_tracking_confidence=args.tracking_confidence
+        min_detection_confidence=detection_confidence,
+        min_tracking_confidence=tracking_confidence
     )
 
     tracker = InnerLipTracker(iou_thresh=0.25, min_frames=2)
@@ -200,7 +213,7 @@ def main():
             if pbar:
                 pbar.update(1)
             
-            if frame_idx % args.every_n != 0:
+            if frame_idx % every_n != 0:
                 continue
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -266,9 +279,9 @@ def main():
             t_sec = frame_idx / fps
             timeline.append({"time": t_sec, "people": people})
 
-            if args.show:
+            if show:
                 vis = frame.copy()
-                if args.viz_inner_lip:
+                if viz_inner_lip:
                     draw_overlay(vis, width, height, people, matched_lm)
                 else:
                     draw_overlay(vis, width, height, people, None)
@@ -284,13 +297,50 @@ def main():
         cv2.destroyAllWindows()
         face_mesh.close()
 
-    if args.out == "inner_lip_movement.json":
-        outfile = args.video + ".json"
-    else:
-        outfile = args.out
-    with open(args.out, "w") as f:
+    # Determine output file path
+    if output_path is None:
+        output_path = f"{video_path}.json"
+    elif output_path == "inner_lip_movement.json":
+        output_path = f"{video_path}.json"
+
+    # Write results to JSON
+    with open(output_path, "w") as f:
         json.dump(timeline, f, indent=2)
-    print(f"Wrote {args.out}")
+    
+    print(f"Wrote {output_path}")
+    return output_path
+
+
+def main():
+    """Command line interface for istalking.py"""
+    ap = argparse.ArgumentParser(description="Speaking Detector (lip opening rate)")
+    ap.add_argument("--video", required=True, help="Input video path")
+    ap.add_argument("--out", default="inner_lip_movement.json", help="Output JSON path")
+    ap.add_argument("--max-faces", type=int, default=10)
+    ap.add_argument("--every-n", type=int, default=1)
+    ap.add_argument("--show", action="store_true")
+    ap.add_argument("--viz-inner-lip", action="store_true")
+    ap.add_argument("--buffer-frames", type=int, default=30,
+                    help="Buffer length in frames")
+    ap.add_argument("--detection-confidence", type=float, default=0.2,
+                    help="Minimum detection confidence for face detection (default: 0.2)")
+    ap.add_argument("--tracking-confidence", type=float, default=0.2,
+                    help="Minimum tracking confidence for face detection (default: 0.2)")
+    args = ap.parse_args()
+
+    # Call the main analysis function with parsed arguments
+    analyze_video(
+        video_path=args.video,
+        output_path=args.out,
+        max_faces=args.max_faces,
+        every_n=args.every_n,
+        show=args.show,
+        viz_inner_lip=args.viz_inner_lip,
+        buffer_frames=args.buffer_frames,
+        detection_confidence=args.detection_confidence,
+        tracking_confidence=args.tracking_confidence
+    )
+
 
 if __name__ == "__main__":
     main()
