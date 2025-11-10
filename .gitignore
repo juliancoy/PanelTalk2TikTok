@@ -8,3 +8,15 @@ output
 *.wav
 *.txt
 *__pycache__
+hftoken.txt
+*_data
+*.aup
+*.m4a
+*.png
+PosterSession
+GovernedByRisk
+CantonLaughs
+*.zip
+Unconfirmed*
+*download
+CLIMATE*

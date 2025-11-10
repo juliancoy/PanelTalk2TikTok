@@ -152,7 +152,9 @@ def analyze_video(
     viz_inner_lip: bool = False,
     buffer_frames: int = 30,
     detection_confidence: float = 0.2,
-    tracking_confidence: float = 0.2
+    tracking_confidence: float = 0.2,
+    splits: int = 1,
+    crop_percent: float = 0.0
 ) -> str:
     """
     Analyze a video for speaking activity using lip movement detection.
@@ -182,6 +184,18 @@ def analyze_video(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     print(f"Video: {video_path} ({width}x{height}, {fps:.1f} FPS)")
+
+    # compute vertical crop parameters (crop_percent is fraction to remove
+    # from both top and bottom). Values are in pixels and fixed for the video.
+    if crop_percent is None:
+        crop_percent = 0.0
+    if crop_percent < 0.0 or crop_percent >= 0.5:
+        raise SystemExit("crop_percent must be in range [0.0, 0.5)")
+    crop_top_px = int(round(height * float(crop_percent)))
+    crop_bottom_px = int(round(height * float(crop_percent)))
+    crop_h = height - crop_top_px - crop_bottom_px
+    if crop_h <= 0:
+        raise SystemExit("Crop percent too large, resulted in non-positive crop height")
 
     mp_face_mesh = mp.solutions.face_mesh
     face_mesh = mp_face_mesh.FaceMesh(
@@ -217,14 +231,45 @@ def analyze_video(
                 continue
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            res = face_mesh.process(rgb)
+
+            # apply vertical crop (top & bottom) before feeding into MediaPipe
+            if crop_percent > 0.0:
+                proc_rgb = rgb[crop_top_px:height - crop_bottom_px, :, :]
+                proc_h = crop_h
+            else:
+                proc_rgb = rgb
+                proc_h = height
 
             detections, faces_lm = [], []
-            if res.multi_face_landmarks:
-                for flm in res.multi_face_landmarks:
-                    lm = np.array([[p.x, p.y] for p in flm.landmark], dtype=np.float32)
-                    faces_lm.append(lm)
-                    detections.append(bbox_from_landmarks(lm, width, height))
+            if splits is None or splits <= 1:
+                # process using the vertically-cropped frame (proc_rgb)
+                res = face_mesh.process(proc_rgb)
+                if res and res.multi_face_landmarks:
+                    for flm in res.multi_face_landmarks:
+                        # map landmark y from proc-local normalized coords to full-frame normalized coords
+                        lm = np.array([[p.x, (p.y * proc_h + crop_top_px) / float(height)] for p in flm.landmark], dtype=np.float32)
+                        faces_lm.append(lm)
+                        detections.append(bbox_from_landmarks(lm, width, height))
+            else:
+                # Process the frame in vertical splits (and with vertical crop) and remap landmark coords
+                split_w = float(width) / float(splits)
+                for s in range(splits):
+                    x1 = int(round(s * split_w))
+                    x2 = int(round((s + 1) * split_w)) if s < splits - 1 else width
+                    # apply horizontal split on the vertically-cropped image
+                    split_crop = proc_rgb[:, x1:x2]
+                    res = face_mesh.process(split_crop)
+                    if res and res.multi_face_landmarks:
+                        for flm in res.multi_face_landmarks:
+                            # remap landmark x from split-local normalized coords to global normalized coords,
+                            # and remap landmark y from proc-local to full-frame normalized coords.
+                            lm = np.array([
+                                [ (p.x * (x2 - x1) + x1) / float(width),
+                                  (p.y * proc_h + crop_top_px) / float(height) ]
+                                for p in flm.landmark
+                            ], dtype=np.float32)
+                            faces_lm.append(lm)
+                            detections.append(bbox_from_landmarks(lm, width, height))
 
             assigned = tracker.update(detections, frame_idx)
             people, matched_lm = [], []
@@ -326,6 +371,10 @@ def main():
                     help="Minimum detection confidence for face detection (default: 0.2)")
     ap.add_argument("--tracking-confidence", type=float, default=0.2,
                     help="Minimum tracking confidence for face detection (default: 0.2)")
+    ap.add_argument("--splits", type=int, default=1,
+                    help="Number of vertical splits to divide each frame into for separate processing (default: 1)")
+    ap.add_argument("--crop-percent", type=float, default=0.0,
+                    help="Fraction to crop from both top and bottom of each frame before processing (0.0-0.49)")
     args = ap.parse_args()
 
     # Call the main analysis function with parsed arguments
@@ -338,7 +387,9 @@ def main():
         viz_inner_lip=args.viz_inner_lip,
         buffer_frames=args.buffer_frames,
         detection_confidence=args.detection_confidence,
-        tracking_confidence=args.tracking_confidence
+        tracking_confidence=args.tracking_confidence,
+        splits=args.splits,
+        crop_percent=args.crop_percent
     )
 
 
