@@ -59,11 +59,31 @@ echo "Cache dir:   $CACHE_DIR"
 echo "=========================================="
 
 # Check if Docker image exists, build if not
-if ! docker image inspect tribev2:latest >/dev/null 2>&1; then
-    echo "Docker image 'tribev2:latest' not found. Building..."
+# Also check if we should force rebuild (if Dockerfile is newer than image)
+FORCE_REBUILD=false
+if docker image inspect tribev2:latest >/dev/null 2>&1; then
+    # Check if Dockerfile is newer than image
+    if [ -f "tribev2/Dockerfile" ]; then
+        IMAGE_CREATED=$(docker image inspect tribev2:latest --format '{{.Created}}' | cut -d'T' -f1)
+        DOCKERFILE_MODIFIED=$(stat -c %Y tribev2/Dockerfile)
+        # Convert image created time to timestamp (approximate)
+        IMAGE_TIMESTAMP=$(date -d "$IMAGE_CREATED" +%s 2>/dev/null || echo 0)
+        if [ $DOCKERFILE_MODIFIED -gt $IMAGE_TIMESTAMP ]; then
+            echo "Dockerfile has been modified since image was built. Forcing rebuild..."
+            FORCE_REBUILD=true
+        fi
+    fi
+fi
+
+if ! docker image inspect tribev2:latest >/dev/null 2>&1 || [ "$FORCE_REBUILD" = true ]; then
+    echo "Building Docker image 'tribev2:latest'..."
     if [ -d "tribev2" ]; then
         cd tribev2
-        docker build -t tribev2 .
+        if [ "$FORCE_REBUILD" = true ]; then
+            docker build --no-cache -t tribev2 .
+        else
+            docker build -t tribev2 .
+        fi
         cd ..
     else
         echo "Error: 'tribev2' directory not found. Cannot build Docker image."
