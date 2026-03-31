@@ -13,3 +13,6 @@
 [submodule "editor/rtaudio"]
 	path = editor/rtaudio
 	url = https://github.com/thestk/rtaudio.git
+[submodule "tribev2"]
+	path = tribev2
+	url = https://github.com/facebookresearch/tribev2
