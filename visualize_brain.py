@@ -1,138 +1,217 @@
 #!/usr/bin/env python3
 """
-Visualize TribeV2 brain predictions on cortical surface.
-This is the intended visualization method.
+visualize_brain.py - Simple visualization for TribeV2 brain predictions
+
+Usage:
+    python visualize_brain.py <npy_file> [--video <video_file>]
+
+Example:
+    python visualize_brain.py CodeCollective/swc_preliminary_tribe.npy
+    python visualize_brain.py CodeCollective/swc_preliminary_tribe.npy --video CodeCollective/swc_preliminary.mp4
 """
 
 import argparse
 import numpy as np
-import sys
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / 'tribev2'))
 
-from tribev2.plotting import PlotBrain
-
-
-def visualize_surface(npy_file, timesteps=10, output='brain_viz.png'):
-    """
-    Create the standard TribeV2 visualization:
-    - Multiple timesteps side by side
-    - Cortical surface on fsaverage5 mesh
-    - Fire colormap (black=low, red=med, yellow/white=high)
-    """
-    # Load predictions
-    preds = np.load(npy_file)
-    print(f"Loaded: {preds.shape} - {preds.shape[0]}s video, {preds.shape[1]} vertices")
-    
-    # Create plotter on fsaverage5 surface
-    plotter = PlotBrain(
-        mesh="fsaverage5",      # Standard brain mesh (20k vertices)
-        inflate="half",         # Half-inflated surface (good visibility)
-        bg_map="sulcal",        # Show sulcal/gyral patterns
-    )
-    
-    # Plot first N timesteps
-    n = min(timesteps, preds.shape[0])
-    print(f"Creating visualization for timesteps 0-{n-1}...")
-    
-    fig = plotter.plot_timesteps(
-        preds[:n],
-        segments=None,          # No segment info available from .npy alone
-        views="left",           # Left hemisphere view (best for language/visual)
-        cmap="fire",            # Standard TribeV2 colormap
-        norm_percentile=99,     # Normalize to 99th percentile
-        show_stimuli=False,     # Set True if you have segments with video/audio
-    )
-    
-    fig.savefig(output, dpi=150, bbox_inches='tight')
-    print(f"Saved to: {output}")
-    return fig
+def load_brain_data(npy_path: str):
+    """Load brain prediction data from .npy file."""
+    data = np.load(npy_path)
+    print(f"[BrainViz] Loaded: {npy_path}")
+    print(f"[BrainViz] Shape: {data.shape} (timesteps × vertices)")
+    print(f"[BrainViz] Data range: [{data.min():.3f}, {data.max():.3f}]")
+    return data
 
 
-def visualize_single(npy_file, timestep=0, view="left", output='brain_single.png'):
-    """
-    Plot a single timestep with multiple views (left, right, dorsal, etc.)
-    """
-    preds = np.load(npy_file)
+def plot_timeseries(data: np.ndarray, num_vertices: int = 10):
+    """Plot BOLD response timeseries for selected vertices."""
+    n_timesteps, n_vertices = data.shape
     
-    plotter = PlotBrain(mesh="fsaverage5", inflate="half")
+    # Select vertices with highest variance (most active)
+    variances = np.var(data, axis=0)
+    top_vertices = np.argsort(variances)[-num_vertices:]
     
-    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 6))
     
-    # Create figure with 4 views
-    views = ["left", "right", "dorsal", "ventral"]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    axes = axes.flatten()
+    for i, v in enumerate(top_vertices):
+        ax.plot(data[:, v], label=f'Vertex {v} (var={variances[v]:.3f})', alpha=0.7)
     
-    for ax, view_name in zip(axes, views):
-        plotter.plot_surf(
-            preds[timestep],
-            axes=[ax],
-            views=view_name,
-            cmap="fire",
-            norm_percentile=99,
-        )
-        ax.set_title(f"{view_name.capitalize()} - t={timestep}s")
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('BOLD Response')
+    ax.set_title(f'BOLD Response Timeseries (Top {num_vertices} Most Active Vertices)')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    fig.savefig(output, dpi=150, bbox_inches='tight')
-    print(f"Saved to: {output}")
-    return fig
+    plt.savefig('brain_timeseries.png', dpi=150)
+    print(f"[BrainViz] Saved: brain_timeseries.png")
+    plt.show()
 
 
-def create_brain_video(npy_file, output='brain_video.mp4', fps=2):
-    """
-    Create video animation of brain activity over time
-    """
-    preds = np.load(npy_file)
-    plotter = PlotBrain(mesh="fsaverage5", inflate="half")
+def plot_heatmap(data: np.ndarray):
+    """Plot heatmap of all vertices over time."""
+    fig, ax = plt.subplots(figsize=(14, 8))
     
-    print(f"Creating {preds.shape[0]} frame video at {fps} fps...")
+    # Downsample if too large
+    if data.shape[1] > 1000:
+        step = data.shape[1] // 1000
+        data_plot = data[:, ::step]
+        print(f"[BrainViz] Downsampled vertices {data.shape[1]} → {data_plot.shape[1]} for display")
+    else:
+        data_plot = data
     
-    plotter.plot_timesteps_mp4(
-        preds,
-        filepath=output,
-        fps=fps,
-        cmap="fire",
-        norm_percentile=99,
-        views="left",
-    )
+    im = ax.imshow(data_plot.T, aspect='auto', cmap='hot', interpolation='bilinear')
+    ax.set_xlabel('Timestep')
+    ax.set_ylabel('Vertex (downsampled)')
+    ax.set_title('Brain Activity Heatmap')
+    plt.colorbar(im, ax=ax, label='BOLD Response')
     
-    print(f"Saved video to: {output}")
+    plt.tight_layout()
+    plt.savefig('brain_heatmap.png', dpi=150)
+    print(f"[BrainViz] Saved: brain_heatmap.png")
+    plt.show()
+
+
+def plot_distribution(data: np.ndarray):
+    """Plot distribution of BOLD values."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    
+    # Histogram of all values
+    axes[0].hist(data.flatten(), bins=100, color='blue', alpha=0.7)
+    axes[0].set_xlabel('BOLD Response')
+    axes[0].set_ylabel('Count')
+    axes[0].set_title('Distribution of All Values')
+    axes[0].grid(True, alpha=0.3)
+    
+    # Mean activity per vertex
+    mean_per_vertex = np.mean(data, axis=0)
+    axes[1].hist(mean_per_vertex, bins=50, color='green', alpha=0.7)
+    axes[1].set_xlabel('Mean BOLD Response')
+    axes[1].set_ylabel('Number of Vertices')
+    axes[1].set_title('Mean Activity per Vertex')
+    axes[1].grid(True, alpha=0.3)
+    
+    # Variance per vertex
+    var_per_vertex = np.var(data, axis=0)
+    axes[2].hist(var_per_vertex, bins=50, color='red', alpha=0.7)
+    axes[2].set_xlabel('Variance')
+    axes[2].set_ylabel('Number of Vertices')
+    axes[2].set_title('Activity Variance per Vertex')
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('brain_distribution.png', dpi=150)
+    print(f"[BrainViz] Saved: brain_distribution.png")
+    plt.show()
+
+
+def animate_with_video(data: np.ndarray, video_path: str, output_path: str = None):
+    """Create side-by-side video and brain visualization."""
+    try:
+        import cv2
+    except ImportError:
+        print("[BrainViz] OpenCV (cv2) not installed. Install with: pip install opencv-python")
+        return
+    
+    # Load video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[BrainViz] Error: Could not open video: {video_path}")
+        return
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    print(f"[BrainViz] Video: {frame_count} frames @ {fps:.1f} fps, {width}x{height}")
+    
+    # Create figure for brain activity
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Video frame placeholder
+    ax1.set_title('Video')
+    ax1.axis('off')
+    im1 = ax1.imshow(np.zeros((height, width, 3), dtype=np.uint8))
+    
+    # Right: Brain activity plot
+    n_timesteps = data.shape[0]
+    time_per_frame = frame_count / n_timesteps
+    
+    # Show mean activity across all vertices
+    mean_activity = np.mean(data, axis=1)
+    ax2.plot(mean_activity, color='blue', linewidth=2)
+    ax2.set_xlabel('Timestep')
+    ax2.set_ylabel('Mean BOLD Response')
+    ax2.set_title('Brain Activity (Mean across all vertices)')
+    ax2.grid(True, alpha=0.3)
+    
+    # Add vertical line for current position
+    vline = ax2.axvline(x=0, color='red', linestyle='--', linewidth=2)
+    
+    plt.tight_layout()
+    
+    # Animation function
+    def update(frame_idx):
+        ret, frame = cap.read()
+        if not ret:
+            return im1, vline
+        
+        # Convert BGR to RGB
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        im1.set_array(frame_rgb)
+        
+        # Update brain activity indicator
+        brain_idx = int((frame_idx / frame_count) * n_timesteps)
+        brain_idx = min(brain_idx, n_timesteps - 1)
+        vline.set_xdata([brain_idx, brain_idx])
+        
+        return im1, vline
+    
+    anim = FuncAnimation(fig, update, frames=frame_count, interval=1000/fps, blit=True)
+    
+    if output_path:
+        anim.save(output_path, fps=fps, dpi=100)
+        print(f"[BrainViz] Saved animation: {output_path}")
+    else:
+        plt.show()
+    
+    cap.release()
+    plt.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Visualize TribeV2 brain predictions on cortical surface'
-    )
-    parser.add_argument('npy_file', help='Path to _tribe.npy file')
-    parser.add_argument('--mode', '-m', choices=['multi', 'single', 'video'],
-                        default='multi',
-                        help='Visualization mode (default: multi)')
-    parser.add_argument('--timesteps', '-t', type=int, default=10,
-                        help='Number of timesteps for multi mode (default: 10)')
-    parser.add_argument('--timestep', '-s', type=int, default=0,
-                        help='Single timestep to plot (default: 0)')
-    parser.add_argument('--output', '-o', default=None,
-                        help='Output filename')
-    parser.add_argument('--fps', type=int, default=2,
-                        help='Video frame rate (default: 2)')
+    parser = argparse.ArgumentParser(description='Visualize TribeV2 brain predictions')
+    parser.add_argument('npy', help='Path to _tribe.npy file')
+    parser.add_argument('--video', '-v', help='Optional: path to video file for side-by-side')
+    parser.add_argument('--output', '-o', help='Output path for animation (e.g., output.mp4)')
+    parser.add_argument('--vertices', type=int, default=10, help='Number of vertices to plot (default: 10)')
+    parser.add_argument('--heatmap', action='store_true', help='Show heatmap')
+    parser.add_argument('--distribution', action='store_true', help='Show distribution plots')
+    parser.add_argument('--all', action='store_true', help='Show all plots')
     
     args = parser.parse_args()
     
-    if args.mode == 'multi':
-        output = args.output or args.npy_file.replace('.npy', '_multi.png')
-        visualize_surface(args.npy_file, args.timesteps, output)
+    # Load data
+    data = load_brain_data(args.npy)
     
-    elif args.mode == 'single':
-        output = args.output or args.npy_file.replace('.npy', f'_t{args.timestep}.png')
-        visualize_single(args.npy_file, args.timestep, output=output)
+    # Show plots
+    if args.all or (not args.heatmap and not args.distribution and not args.video):
+        plot_timeseries(data, num_vertices=args.vertices)
     
-    elif args.mode == 'video':
-        output = args.output or args.npy_file.replace('.npy', '.mp4')
-        create_brain_video(args.npy_file, output, args.fps)
+    if args.all or args.heatmap:
+        plot_heatmap(data)
+    
+    if args.all or args.distribution:
+        plot_distribution(data)
+    
+    # Animate with video if provided
+    if args.video:
+        animate_with_video(data, args.video, args.output)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
