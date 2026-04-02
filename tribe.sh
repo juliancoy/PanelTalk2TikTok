@@ -34,8 +34,11 @@ INPUT_BASENAME=$(basename "$INPUT_FILE_ABS")
 INPUT_NAME="${INPUT_BASENAME%.*}"
 INPUT_EXT="${INPUT_BASENAME##*.}"
 
-# Determine output filename
-OUTPUT_BASENAME="${INPUT_NAME}_tribe.npy"
+# Get video model selection
+VIDEO_MODEL="${VIDEOMODEL:-vitg}"
+
+# Determine output filename with model suffix
+OUTPUT_BASENAME="${INPUT_NAME}_tribe_${VIDEO_MODEL}.npy"
 OUTPUT_FILE="$INPUT_DIR/$OUTPUT_BASENAME"
 
 # Check if output file already exists and is up to date
@@ -63,8 +66,8 @@ if [ -f "$OUTPUT_FILE" ]; then
     fi
 fi
 
-# Use .tribe_cache for everything (models and features) - simpler and already populated
-CACHE_DIR="$INPUT_DIR/.tribe_cache"
+# Use model-specific cache directory to avoid conflicts between models
+CACHE_DIR="$INPUT_DIR/.tribe_cache_${VIDEO_MODEL}"
 mkdir -p "$CACHE_DIR"
 
 # Check for existing features cache
@@ -293,7 +296,7 @@ config_update = {
     'data.num_workers': 0,  # Avoid multiprocessing memory overhead
 }
 
-# Check for video model selection (vitg = default, vitl = faster/smaller)
+# Use video model from environment (set by bash script)
 video_model = os.environ.get('VIDEOMODEL', 'vitg')
 if video_model == 'vitl':
     model_name = 'facebook/vjepa2-vitl-fpc64-256'

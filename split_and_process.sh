@@ -28,13 +28,12 @@ echo "Video duration: ${DURATION}s"
 
 if [ "$DURATION" -lt 60 ]; then
     echo "Video is short enough, processing directly..."
-    VIDEOMODEL=vitl ./tribe.sh "$INPUT_FILE"
+    ./tribe.sh "$INPUT_FILE"
     exit 0
 fi
 
 # Create segments directory (use /tmp to avoid permission issues with existing cache)
-SEGMENTS_DIR="/tmp/tribe_segments_${NAME_NO_EXT}"
-rm -rf "$SEGMENTS_DIR"
+SEGMENTS_DIR="/tmp/tribe_segments_${NAME_NO_EXT}_$$"
 mkdir -p "$SEGMENTS_DIR"
 
 echo "Splitting into ${SEGMENT_SEC}s segments..."
@@ -60,10 +59,14 @@ for segment in "$SEGMENTS_DIR"/*.mp4; do
     echo "File: $segment"
     echo "=========================================="
     
-    VIDEOMODEL=vitl ./tribe.sh "$segment"
+    ./tribe.sh "$segment"
 done
 
 echo "=========================================="
 echo "All segments processed!"
 echo "Segments directory: $SEGMENTS_DIR"
+echo ""
+echo "Output files:"
+VIDEO_MODEL="${VIDEOMODEL:-vitg}"
+ls -lh "$SEGMENTS_DIR"/*_tribe_${VIDEO_MODEL}.npy 2>/dev/null || echo "  (check individual segment directories)"
 echo "=========================================="
