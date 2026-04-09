@@ -16,3 +16,6 @@
 [submodule "tribev2"]
 	path = tribev2
 	url = https://github.com/facebookresearch/tribev2
+[submodule "motive3d"]
+	path = motive3d
+	url = https://github.com/juliancoy/motive
