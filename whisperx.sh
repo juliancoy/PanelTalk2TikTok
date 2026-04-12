@@ -1,28 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# fail early if token file missing
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <input-audio-or-video-file>" >&2
+  exit 1
+fi
+
 if [[ ! -f hftoken.txt ]]; then
   echo "ERROR: hftoken.txt not found" >&2
   exit 1
 fi
 
-# read token and strip newline/carriage return
 HF_TOKEN="$(tr -d '\r\n' < hftoken.txt)"
-
-# ensure local cache dir exists (mapped into container)
 mkdir -p .cache
 
-# write outputs alongside the input file
-OUT_DIR="$(dirname "$1")"
+HOST_PWD="$(pwd)"
+HOST_PWD_ABS="$(readlink -f "$HOST_PWD")"
+INPUT_ABS="$(readlink -f "$1")"
 
-# optional: avoid exposing token in ps output by not using env var inline on the docker command line
-# (here we set it with -e so it is available inside the container)
-docker run --gpus all -it \
+if [[ ! -f "$INPUT_ABS" ]]; then
+  echo "ERROR: input file not found: $1" >&2
+  exit 1
+fi
+
+case "$INPUT_ABS" in
+  "$HOST_PWD_ABS"/*) ;;
+  *)
+    echo "ERROR: input file must be inside the current project directory:" >&2
+    echo "  project dir: $HOST_PWD_ABS" >&2
+    echo "  input file : $INPUT_ABS" >&2
+    exit 1
+    ;;
+esac
+
+CONTAINER_INPUT="/app/${INPUT_ABS#$HOST_PWD_ABS/}"
+CONTAINER_OUT_DIR="$(dirname "$CONTAINER_INPUT")"
+
+docker run --rm --gpus all -it \
   --user "$(id -u):$(id -g)" \
-  -v "$(pwd)/.cache":/.cache \
-  -v "$(pwd)/.cache":/tmp/.cache \
-  -v "$(pwd)":/app -w /app \
+  -v "$HOST_PWD_ABS/.cache":/.cache \
+  -v "$HOST_PWD_ABS/.cache":/tmp/.cache \
+  -v "$HOST_PWD_ABS":/app \
+  -w /app \
   -e HOME="/tmp" \
   -e HF_TOKEN="$HF_TOKEN" \
   -e MPLCONFIGDIR="/tmp/.cache/matplotlib" \
@@ -31,11 +50,9 @@ docker run --gpus all -it \
   -e TRANSFORMERS_CACHE="/tmp/.cache/huggingface/transformers" \
   -e TORCH_HOME="/tmp/.cache/torch" \
   ghcr.io/jim60105/whisperx:large-v3-tl-77e20c4 \
-  whisperx "$1" \
-    --output_dir "$OUT_DIR" \
+  whisperx "$CONTAINER_INPUT" \
+    --output_dir "$CONTAINER_OUT_DIR" \
     --output_format json \
     --diarize \
     --language en \
     --hf_token "$HF_TOKEN"
-
-#-v "$(pwd)/.cache":/.cache/torch/hub/checkpoints \
