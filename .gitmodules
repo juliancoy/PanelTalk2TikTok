@@ -19,3 +19,7 @@
 [submodule "motive3d"]
 	path = motive3d
 	url = https://github.com/juliancoy/motive
+[submodule "editor/ffmpeg"]
+	path = editor/ffmpeg
+	url = https://github.com/FFmpeg/FFmpeg.git
+	branch = release/6.0
