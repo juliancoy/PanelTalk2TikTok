@@ -7,7 +7,6 @@ data_offset
 output
 *.wav
 *.mp3
-*.txt
 *__pycache__
 hftoken.txt
 *_data
