@@ -10,16 +10,12 @@
 [submodule "sam3"]
 	path = sam3
 	url = https://github.com/facebookresearch/sam3
-[submodule "editor/rtaudio"]
-	path = editor/rtaudio
-	url = https://github.com/thestk/rtaudio.git
 [submodule "tribev2"]
 	path = tribev2
 	url = https://github.com/facebookresearch/tribev2
 [submodule "motive3d"]
 	path = motive3d
 	url = https://github.com/juliancoy/motive
-[submodule "editor/ffmpeg"]
-	path = editor/ffmpeg
-	url = https://github.com/FFmpeg/FFmpeg.git
-	branch = release/6.0
+[submodule "JCut"]
+	path = JCut
+	url = ../JCut
