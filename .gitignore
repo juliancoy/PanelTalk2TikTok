@@ -33,3 +33,12 @@ CodeCollective
 .venv*
 editor/PanelTalkEditor.dmg
 Politics*
+themes_words.txt
+profile_summary.txt
+list.txt
+last_dir.txt
+inputs.txt
+files.txt
+editor/CMakeCache.txt
+editor/editor_header_split_additions.txt
+editor/Testing/Temporary/CTestCostData.txt
